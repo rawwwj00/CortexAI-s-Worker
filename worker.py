@@ -3,16 +3,16 @@ import io
 import json
 import google.auth
 from google.cloud import firestore
+import google.oauth2.credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from flask import Flask, request
 
-# --- Local Module Imports ---
 from utils import extract_text_from_file
 from theory_analyzer import analyze_theory_submission
 from programming_analyzer import analyze_programming_submission
 
-# --- Initialization ---
+# Explicitly use the VM's Service Account for Firestore
 fs_credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/datastore"])
 db = firestore.Client(credentials=fs_credentials, database="cortex-ai")
 app = Flask(__name__)
@@ -21,7 +21,7 @@ app = Flask(__name__)
 def process_attachment_task():
     task_data = request.get_json()
     
-    # Rebuild the user's credentials, ONLY for accessing their Google Drive file.
+    # Rebuild the user's credentials, ONLY for accessing their Google Drive file
     user_credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
     drive_service = build('drive', 'v3', credentials=user_credentials)
     
@@ -34,6 +34,7 @@ def process_attachment_task():
     
     final_score = 0.0
     final_justification = "Failed to process attachment."
+    debug_info = "No debug information generated."
 
     try:
         file_id = drive_file['id']
@@ -55,20 +56,23 @@ def process_attachment_task():
             
             final_score = result.get('score', 0.0)
             final_justification = result.get('justification', 'AI analysis failed.')
+            debug_info = result.get('debug_info', 'No debug info from analyzer.')
         else:
             final_justification = "Unsupported file type or empty file."
+            debug_info = f"MIME Type: {mime_type}. File was empty or could not be read."
 
     except Exception as e:
         print(f"Worker failed on attachment for student {student_id}. Error: {e}")
         final_justification = "Attachment failed to process due to a critical error."
+        debug_info = f"Critical error in worker: {e}"
             
-    # Save a result for THIS ATTACHMENT
-    unique_part = drive_file['id']
-    doc_id = f"{course_id}-{student_id}-{assignment_id}-{unique_part}"
+    doc_id = f"{course_id}-{student_id}-{assignment_id}-{drive_file['id']}"
     doc_ref = db.collection('results').document(doc_id)
     doc_ref.set({
         'course_id': course_id, 'student_id': student_id, 'assignment_id': assignment_id,
-        'accuracy_score': final_score, 'justification': final_justification
+        'accuracy_score': final_score, 
+        'justification': final_justification,
+        'debug_info': debug_info
     })
     
     return "OK", 200
