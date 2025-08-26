@@ -158,8 +158,24 @@ def _fix_code(code: str, language: str) -> str:
         cleaned_text = cleaned_text[:-3].strip()
     return cleaned_text
     
-def _generate_test_cases(question: str, language: str) -> list:
-    prompt = f'Based on the following programming question, generate a list of 5 diverse test cases. Provide your response as a single, valid JSON object. The object should be a list of dictionaries, where each dictionary has "input" and "expected_output".\n\nQuestion: "{question}"'
+def _generate_test_cases(question: str, code_snippet: str, language: str) -> list:
+    """
+    Generates test cases for a specific code snippet, using the overall question for context.
+    """
+    prompt = f'''
+    You are a test case generator for a single function. Based on the provided {language} code snippet and the original assignment question, generate 5 diverse test cases. The code reads from standard input. 
+    
+    Provide your response as a single, valid JSON object. The object should be a list of dictionaries, where each dictionary has an "input" key and an "expected_output" key.
+
+    ---
+    Original Assignment Question: "{question}"
+    ---
+    Code Snippet to Test:
+    ```
+    {code_snippet}
+    ```
+    ---
+    '''
     try:
         response = programming_model.generate_content(prompt)
         json_text = response.text.replace("```json", "").replace("```", "").strip()
@@ -243,3 +259,4 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     final_justification = " | ".join(all_justifications)
     
     return {'score': average_score, 'justification': final_justification}
+
