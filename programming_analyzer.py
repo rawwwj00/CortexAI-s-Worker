@@ -215,47 +215,44 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     if not programming_model or not ocr_code:
         return {'score': 0.0, 'justification': 'Missing Gemini model or student code.'}
 
-    # 1. Intelligently split the submission into parts based on the question
     program_parts = _split_submission_into_parts(question, ocr_code)
     if not program_parts:
         return {'score': 0.0, 'justification': 'No valid programs were found in the submission.'}
 
     total_score, all_justifications = 0.0, []
 
-    # 2. Loop through each part and analyze it down the correct path
     for i, program_code in enumerate(program_parts):
         justification_prefix = f"Part {i+1}"
+        
+        # This 'try' block was missing its 'except'
         try:
             language = _detect_language(program_code)
             fixed_code = _fix_code(program_code, language)
             
-            # 3. Use the fast, reliable static check for input
             takes_input = _check_for_input_statically(fixed_code, language)
             
             if takes_input:
                 test_cases = _generate_test_cases(question, fixed_code, language)
-    
-            if not test_cases:
-                all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
-                continue
-    
-    passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
-    score = passed_cases / len(test_cases) if test_cases else 0.0
-    all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
+                if not test_cases:
+                    all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
+                    continue
+                passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
+                score = passed_cases / len(test_cases) if test_cases else 0.0
+                all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
             else:
-                # CONCEPTUAL PATH: AI review for non-input code
                 conceptual_result = _analyze_code_conceptually(question, fixed_code, language)
                 score = conceptual_result.get('score', 0.0)
                 justification = conceptual_result.get('justification', 'AI analysis failed.')
                 all_justifications.append(f"{justification_prefix}: {justification}")
 
             total_score += score
+
+        # ✅ THIS IS THE MISSING BLOCK THAT NEEDS TO BE ADDED
         except Exception as e:
             print(f"A critical error occurred during analysis of program part {i+1}: {e}")
             all_justifications.append(f"{justification_prefix}: Analysis failed with a critical error.")
             continue
     
-    # 4. Calculate the final average score
     average_score = total_score / len(program_parts) if program_parts else 0.0
     final_justification = " | ".join(all_justifications)
     
