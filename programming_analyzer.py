@@ -13,42 +13,8 @@ try:
 except Exception as e:
     programming_model = None
 
-def analyze_programming_submission(question: str, ocr_code: str) -> dict:
-    """
-    A fully automated pipeline to analyze a programming submission that may
-    contain one or more separate programs. The final score is an average.
-    """
-    if not programming_model or not ocr_code:
-        return {'score': 0.0, 'justification': 'Missing model or student code.'}
 
-    programs = _split_programs(ocr_code)
-    if not programs:
-        return {'score': 0.0, 'justification': 'No valid programs were found in the submission.'}
-
-    total_score, all_justifications, program_count = 0.0, [], len(programs)
-
-    for i, program_code in enumerate(programs):
-        try:
-            language = _detect_language(program_code)
-            fixed_code = _fix_code(program_code, language)
-            test_cases = _generate_test_cases(question, language)
-            if not test_cases:
-                all_justifications.append(f"P{i+1}: Could not generate test cases.")
-                continue
-
-            passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
-            score = passed_cases / len(test_cases) if test_cases else 0.0
-            
-            total_score += score
-            all_justifications.append(f"P{i+1}: Passed {passed_cases}/{len(test_cases)} tests.")
-        except Exception as e:
-            print(f"A critical error occurred during analysis of program {i+1}: {e}")
-            all_justifications.append(f"P{i+1}: Analysis failed with a critical error.")
-            continue
-    
-    average_score = total_score / program_count if program_count > 0 else 0.0
-    final_justification = " | ".join(all_justifications)
-    return {'score': average_score, 'justification': final_justification}
+# --- HELPER FUNCTIONS (DEFINED FIRST) ---
 
 def _detect_language(code: str) -> str:
     """Detects the programming language of the given code snippet."""
@@ -123,10 +89,20 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
                 numbers_from_actual = re.findall(r'-?\d+\.?\d*', container_output)
                 numbers_from_expected = re.findall(r'-?\d+\.?\d*', expected_output)
 
+                passed = False
                 if numbers_from_expected and numbers_from_actual == numbers_from_expected:
-                    passed_count += 1
+                    passed = True
                 elif expected_output.lower() in container_output.lower():
+                    passed = True
+
+                if passed:
                     passed_count += 1
+                else:
+                    print("--- TEST CASE FAILED ---")
+                    print(f"Input: {case.get('input')}")
+                    print(f"Expected Output: '{expected_output}'")
+                    print(f"Actual Output:   '{container_output}'")
+                    print("------------------------")
             
             except docker.errors.ContainerError as e:
                 print(f"Container error: {e.stderr.decode('utf-8')}")
@@ -155,3 +131,43 @@ def _split_programs(ocr_text: str) -> list:
         return json.loads(json_text).get("programs", [])
     except Exception:
         return [ocr_text] # Fallback if AI fails
+
+
+# --- MAIN ANALYSIS FUNCTION (DEFINED LAST) ---
+
+def analyze_programming_submission(question: str, ocr_code: str) -> dict:
+    """
+    A fully automated pipeline to analyze a programming submission that may
+    contain one or more separate programs. The final score is an average.
+    """
+    if not programming_model or not ocr_code:
+        return {'score': 0.0, 'justification': 'Missing model or student code.'}
+
+    programs = _split_programs(ocr_code)
+    if not programs:
+        return {'score': 0.0, 'justification': 'No valid programs were found in the submission.'}
+
+    total_score, all_justifications, program_count = 0.0, [], len(programs)
+
+    for i, program_code in enumerate(programs):
+        try:
+            language = _detect_language(program_code)
+            fixed_code = _fix_code(program_code, language)
+            test_cases = _generate_test_cases(question, language)
+            if not test_cases:
+                all_justifications.append(f"P{i+1}: Could not generate test cases.")
+                continue
+
+            passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
+            score = passed_cases / len(test_cases) if test_cases else 0.0
+            
+            total_score += score
+            all_justifications.append(f"P{i+1}: Passed {passed_cases}/{len(test_cases)} tests.")
+        except Exception as e:
+            print(f"A critical error occurred during analysis of program {i+1}: {e}")
+            all_justifications.append(f"P{i+1}: Analysis failed with a critical error.")
+            continue
+    
+    average_score = total_score / program_count if program_count > 0 else 0.0
+    final_justification = " | ".join(all_justifications)
+    return {'score': average_score, 'justification': final_justification}
