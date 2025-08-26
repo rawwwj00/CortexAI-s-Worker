@@ -7,7 +7,6 @@ import google.generativeai as genai
 
 # Configure the Gemini API client at the module level
 try:
-    # This will use the GEMINI_API_KEY from the systemd environment
     genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
     programming_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 except Exception as e:
@@ -50,7 +49,7 @@ def _generate_test_cases(question: str, language: str) -> list:
         return []
 
 def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
-    """Runs student code in a sandboxed Docker container and checks it against test cases."""
+    """Runs student code in a sandboxed Docker container with robust checking."""
     try:
         client = docker.from_env()
     except docker.errors.DockerException:
@@ -86,18 +85,22 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
                 
                 expected_output = str(case.get('expected_output', '')).strip()
 
+                # --- NEW: More Robust Multi-Stage Checker ---
+                passed = False
+                # 1. Try comparing just the numbers found in the strings
                 numbers_from_actual = re.findall(r'-?\d+\.?\d*', container_output)
                 numbers_from_expected = re.findall(r'-?\d+\.?\d*', expected_output)
-
-                passed = False
                 if numbers_from_expected and numbers_from_actual == numbers_from_expected:
                     passed = True
+                
+                # 2. If that fails, try checking if the expected text is contained in the actual output
                 elif expected_output.lower() in container_output.lower():
                     passed = True
 
                 if passed:
                     passed_count += 1
                 else:
+                    # Detailed logging for failed tests
                     print("--- TEST CASE FAILED ---")
                     print(f"Input: {case.get('input')}")
                     print(f"Expected Output: '{expected_output}'")
@@ -116,7 +119,7 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
 def _split_programs(ocr_text: str) -> list:
     """Uses the AI model to identify and separate multiple programs from a single block of text."""
     if not programming_model or not ocr_text.strip():
-        return [ocr_text] # Fallback
+        return [ocr_text]
     prompt = f"""
     The following text may contain one or more distinct computer programs.
     Separate each complete program into a JSON list of strings under the key "programs".
@@ -130,7 +133,7 @@ def _split_programs(ocr_text: str) -> list:
         json_text = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(json_text).get("programs", [])
     except Exception:
-        return [ocr_text] # Fallback if AI fails
+        return [ocr_text]
 
 
 # --- MAIN ANALYSIS FUNCTION (DEFINED LAST) ---
