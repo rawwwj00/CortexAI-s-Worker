@@ -15,8 +15,9 @@ from programming_analyzer import analyze_programming_submission
 
 # --- Firestore Initialization ---
 from google.cloud import firestore
-db = firestore.Client(database="cortex-ai")
-
+import google.auth
+fs_credentials, _ = google.auth.default()
+db = firestore.Client(credentials=fs_credentials, database="cortex-ai")
 app = Flask(__name__)
 
 @app.route('/process_task', methods=['POST'])
@@ -86,3 +87,4 @@ def process_task():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+
