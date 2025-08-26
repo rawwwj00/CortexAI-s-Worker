@@ -12,63 +12,6 @@ try:
     programming_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 except Exception as e:
     programming_model = None
-@app.route('/process_attachment_task', methods=['POST'])
-
-def process_attachment_task():
-    task_data = request.get_json()
-    
-    user_credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
-    drive_service = build('drive', 'v3', credentials=user_credentials)
-    
-    student_id = task_data['student_id']
-    course_id = task_data['course_id']
-    assignment_id = task_data['assignment_id']
-    domain = task_data['domain']
-    question = task_data['question']
-    drive_file = task_data['drive_file']
-    
-    final_score = 0.0
-    final_justification = "Failed to process attachment."
-
-    try:
-        file_id = drive_file['id']
-        mime_type = drive_service.files().get(fileId=file_id, fields='mimeType').execute().get('mimeType')
-        
-        request_file = drive_service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request_file)
-        done = False
-        while not done: status, done = downloader.next_chunk()
-        
-        ocr_text = extract_text_from_file(fh.getvalue(), mime_type)
-        if ocr_text and ocr_text != "Unsupported File Type":
-            result = {}
-            if domain == 'theory':
-                result = analyze_theory_submission(question, ocr_text)
-            elif domain == 'programming':
-                result = analyze_programming_submission(question, ocr_text)
-            
-            final_score = result.get('score', 0.0)
-            final_justification = result.get('justification', 'AI analysis failed.')
-        else:
-            final_justification = "Unsupported file type or empty file."
-
-    except Exception as e:
-        print(f"Worker failed on attachment for student {student_id}. Error: {e}")
-        final_justification = "Attachment failed to process due to a critical error."
-            
-    # Save a result for THIS ATTACHMENT
-    # Note: We need a unique doc_id for each attachment
-    unique_part = drive_file['id']
-    doc_id = f"{course_id}-{student_id}-{assignment_id}-{unique_part}"
-    doc_ref = db.collection('results').document(doc_id)
-    doc_ref.set({
-        'course_id': course_id, 'student_id': student_id, 'assignment_id': assignment_id,
-        'accuracy_score': final_score, 'justification': final_justification
-    })
-    
-    return "OK", 200
-
 
 def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     """
@@ -182,7 +125,6 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
 
                 if numbers_from_expected and numbers_from_actual == numbers_from_expected:
                     passed_count += 1
-                # --- THIS IS THE CORRECTED LINE ---
                 elif expected_output.lower() in container_output.lower():
                     passed_count += 1
             
@@ -213,4 +155,3 @@ def _split_programs(ocr_text: str) -> list:
         return json.loads(json_text).get("programs", [])
     except Exception:
         return [ocr_text] # Fallback if AI fails
-
