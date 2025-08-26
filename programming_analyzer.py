@@ -12,8 +12,11 @@ try:
 except Exception as e:
     programming_model = None
 
-
 # --- HELPER FUNCTIONS (DEFINED FIRST) ---
+
+def _extract_numbers(text: str) -> list:
+    """Finds all integer and floating-point numbers in a string and returns them as a list of strings."""
+    return re.findall(r'-?\d+\.?\d*', text)
 
 def _detect_language(code: str) -> str:
     """Detects the programming language of the given code snippet."""
@@ -81,20 +84,21 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
                 container_output = client.containers.run(
                     image, command=run_command, volumes={temp_dir: {'bind': '/app', 'mode': 'rw'}},
                     working_dir="/app", remove=True, network_disabled=True, mem_limit='256m'
-                ).decode('utf-8').strip()
+                ).decode('utf-8')
                 
-                expected_output = str(case.get('expected_output', '')).strip()
+                expected_output = str(case.get('expected_output', ''))
 
-                # --- NEW: More Robust Multi-Stage Checker ---
-                passed = False
-                # 1. Try comparing just the numbers found in the strings
-                numbers_from_actual = re.findall(r'-?\d+\.?\d*', container_output)
-                numbers_from_expected = re.findall(r'-?\d+\.?\d*', expected_output)
-                if numbers_from_expected and numbers_from_actual == numbers_from_expected:
-                    passed = True
+                # --- FINAL, ROBUST CHECKER ---
+                numbers_from_actual = _extract_numbers(container_output)
+                numbers_from_expected = _extract_numbers(expected_output)
                 
-                # 2. If that fails, try checking if the expected text is contained in the actual output
-                elif expected_output.lower() in container_output.lower():
+                passed = False
+                # If the expected output contains numbers, the primary check is to see if the lists of numbers match.
+                if numbers_from_expected:
+                    if numbers_from_actual == numbers_from_expected:
+                        passed = True
+                # If no numbers are expected, fall back to a flexible, case-insensitive substring check.
+                elif expected_output.strip().lower() in container_output.strip().lower():
                     passed = True
 
                 if passed:
@@ -103,8 +107,8 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
                     # Detailed logging for failed tests
                     print("--- TEST CASE FAILED ---")
                     print(f"Input: {case.get('input')}")
-                    print(f"Expected Output: '{expected_output}'")
-                    print(f"Actual Output:   '{container_output}'")
+                    print(f"Expected Output: '{expected_output.strip()}'")
+                    print(f"Actual Output:   '{container_output.strip()}'")
                     print("------------------------")
             
             except docker.errors.ContainerError as e:
