@@ -21,30 +21,21 @@ app = Flask(__name__)
 def process_attachment_task():
     task_data = request.get_json()
     
-    # Get all identifiers first. If any of these are missing, the task will fail and retry.
+    user_credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
+    drive_service = build('drive', 'v3', credentials=user_credentials)
+    
     student_id = task_data['student_id']
     course_id = task_data['course_id']
     assignment_id = task_data['assignment_id']
+    domain = task_data['domain']
+    question = task_data['question']
     drive_file = task_data['drive_file']
     
-    # Define the unique document ID for this attachment's result
-    doc_id = f"{course_id}-{student_id}-{assignment_id}-{drive_file['id']}"
-    doc_ref = db.collection('results').document(doc_id)
-
-    # Set default values in case of failure
     final_score = 0.0
-    final_justification = "Attachment failed to process due to a critical error."
-    debug_info = "An unexpected error occurred in the worker."
+    final_justification = "Failed to process attachment."
 
     try:
-        # Rebuild user credentials and Drive service inside the try block
-        user_credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
-        drive_service = build('drive', 'v3', credentials=user_credentials)
-        
-        domain = task_data['domain']
-        question = task_data['question']
         file_id = drive_file['id']
-        
         mime_type = drive_service.files().get(fileId=file_id, fields='mimeType').execute().get('mimeType')
         
         request_file = drive_service.files().get_media(fileId=file_id)
@@ -61,25 +52,24 @@ def process_attachment_task():
             elif domain == 'programming':
                 result = analyze_programming_submission(question, ocr_text)
             
-            # If everything succeeds, update the variables with the good results
             final_score = result.get('score', 0.0)
             final_justification = result.get('justification', 'AI analysis failed.')
-            debug_info = result.get('debug_info', 'No debug info from analyzer.')
         else:
             final_justification = "Unsupported file type or empty file."
-            debug_info = f"MIME Type: {mime_type}. File was empty or could not be read."
 
     except Exception as e:
         print(f"Worker failed on attachment for student {student_id}. Error: {e}")
-        # The default justification is already set, so we just update the debug info
-        debug_info = f"Critical error in worker: {e}"
+        final_justification = "Attachment failed to process due to a critical error."
             
-    # Save the result to Firestore, whether it succeeded or failed
+    doc_id = f"{course_id}-{student_id}-{assignment_id}-{drive_file['id']}"
+    doc_ref = db.collection('results').document(doc_id)
     doc_ref.set({
-        'course_id': course_id, 'student_id': student_id, 'assignment_id': assignment_id,
+        'course_id': course_id, 
+        'student_id': student_id, 
+        'assignment_id': assignment_id,
         'accuracy_score': final_score, 
-        'justification': final_justification,
-        'debug_info': debug_info
+        'justification': final_justification
+        # The 'debug_info' field is no longer saved
     })
     
     return "OK", 200
