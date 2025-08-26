@@ -8,15 +8,57 @@ import google.generativeai as genai
 # Configure the Gemini API client at the module level
 try:
     genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    programming_model = genai.GenerativeModel('gemini-1.5-pro-latest') # Using the more powerful model
+    # Using the more powerful model for better analysis
+    programming_model = genai.GenerativeModel('gemini-1.5-pro-latest')
 except Exception as e:
     programming_model = None
+
 
 # --- HELPER FUNCTIONS (DEFINED FIRST) ---
 
 def _extract_numbers(text: str) -> list:
     """Finds all integer and floating-point numbers in a string and returns them as a list of strings."""
     return re.findall(r'-?\d+\.?\d*', text)
+
+def _check_if_code_takes_input(code: str, language: str) -> bool:
+    """Uses AI to determine if a code snippet reads from standard input."""
+    prompt = f"Does the following {language} code read from standard input (e.g., using `cin`, `input()`, `Scanner`, `scanf`)? Respond with only the word 'yes' or 'no'."
+    try:
+        response = programming_model.generate_content(prompt)
+        return response.text.strip().lower() == 'yes'
+    except Exception as e:
+        print(f"Could not check for input: {e}")
+        return True # Default to assuming it takes input if the check fails
+
+def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
+    """Uses AI to review code that doesn't take input based on its logic and correctness."""
+    prompt = f"""
+    As an expert programming instructor, your task is to evaluate a student's code based on the assignment question.
+    This program does not take standard input, so you must evaluate it conceptually.
+
+    Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
+    - "score": Grade based on correctness, efficiency, and adherence to the question. A perfect, efficient solution gets 1.0. A non-working or logically flawed solution gets 0.0.
+    - "justification": A brief, one-sentence explanation for your score.
+
+    ---
+    Assignment Question: "{question}"
+    ---
+    Student's {language} Code:
+    ```
+    {code}
+    ```
+    ---
+    """
+    try:
+        response = programming_model.generate_content(prompt)
+        json_text = response.text.replace("```json", "").replace("```", "").strip()
+        # Add a debug_info key for consistency
+        result = json.loads(json_text)
+        result['debug_info'] = f"Conceptual Analysis Result: {result.get('score', 0)*100}% - {result.get('justification', 'N/A')}"
+        return result
+    except Exception as e:
+        print(f"Failed to analyze code conceptually: {e}")
+        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.', 'debug_info': f'Error: {e}'}
 
 def _detect_language(code: str) -> str:
     """Detects the programming language of the given code snippet."""
@@ -84,8 +126,8 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> (int, str
                 
                 expected_output = str(case.get('expected_output', ''))
                 
-                numbers_from_actual = re.findall(r'-?\d+\.?\d*', container_output)
-                numbers_from_expected = re.findall(r'-?\d+\.?\d*', expected_output)
+                numbers_from_actual = _extract_numbers(container_output)
+                numbers_from_expected = _extract_numbers(expected_output)
                 
                 passed = False
                 if numbers_from_expected and numbers_from_actual == numbers_from_expected:
@@ -114,7 +156,6 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> (int, str
     return passed_count, '\n'.join(debug_log)
 
 def _split_programs(ocr_text: str) -> list:
-    """Uses the AI model to identify and separate multiple programs from a single block of text."""
     if not programming_model or not ocr_text.strip(): return [ocr_text]
     prompt = f'The following text may contain one or more distinct computer programs. Separate each complete program into a JSON list of strings under the key "programs". If no valid code is found, return an empty list.\n\nSubmission Text:\n"{ocr_text}"'
     try:
@@ -124,12 +165,9 @@ def _split_programs(ocr_text: str) -> list:
     except Exception:
         return [ocr_text]
 
-
 # --- MAIN ANALYSIS FUNCTION (NOW WITH CONDITIONAL LOGIC) ---
+
 def analyze_programming_submission(question: str, ocr_code: str) -> dict:
-    """
-    Analyzes a programming submission and returns a score, justification, and detailed debug log.
-    """
     debug_log = []
     if not programming_model or not ocr_code:
         return {'score': 0.0, 'justification': 'Missing model or student code.', 'debug_info': 'Model or code was empty.'}
@@ -139,7 +177,7 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     if not programs:
         return {'score': 0.0, 'justification': 'No valid programs were found in the submission.', 'debug_info': '\n'.join(debug_log)}
 
-    total_score, all_justifications, program_count = 0.0, [], len(programs)
+    total_score, all_justifications = 0.0, []
 
     for i, program_code in enumerate(programs):
         justification_prefix = f"P{i+1}"
@@ -168,53 +206,15 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
                 score = conceptual_result.get('score', 0.0)
                 justification = conceptual_result.get('justification', 'AI analysis failed.')
                 all_justifications.append(f"{justification_prefix}: {justification}")
-                debug_log.append(f"Conceptual Analysis Result: {score*100}% - {justification}")
+                debug_log.append(conceptual_result.get('debug_info', ''))
 
             total_score += score
+            
         except Exception as e:
             debug_log.append(f"CRITICAL ERROR: {e}")
             all_justifications.append(f"{justification_prefix}: Analysis failed with a critical error.")
             continue
     
-    average_score = total_score / program_count if program_count > 0 else 0.0
+    average_score = total_score / len(programs) if programs else 0.0
     final_justification = " | ".join(all_justifications)
     return {'score': average_score, 'justification': final_justification, 'debug_info': '\n'.join(debug_log)}
-# --- NEW CONCEPTUAL ANALYSIS FUNCTIONS ---
-
-def _check_if_code_takes_input(code: str, language: str) -> bool:
-    """Uses AI to determine if a code snippet reads from standard input."""
-    prompt = f"Does the following {language} code read from standard input (e.g., using `cin`, `input()`, `Scanner`, `scanf`)? Respond with only the word 'yes' or 'no'."
-    try:
-        response = programming_model.generate_content(prompt)
-        return response.text.strip().lower() == 'yes'
-    except Exception as e:
-        print(f"Could not check for input: {e}")
-        return True
-
-def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
-    """Uses AI to review code that doesn't take input based on its logic and correctness."""
-    prompt = f"""
-    As an expert programming instructor, your task is to evaluate a student's code based on the assignment question.
-    This program does not take standard input, so you must evaluate it conceptually.
-
-    Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
-    - "score": Grade based on correctness, efficiency, and adherence to the question. A perfect, efficient solution gets 1.0. A non-working or logically flawed solution gets 0.0.
-    - "justification": A brief, one-sentence explanation for your score.
-
-    ---
-    Assignment Question: "{question}"
-    ---
-    Student's {language} Code:
-    ```
-    {code}
-    ```
-    ---
-    """
-    try:
-        response = programming_model.generate_content(prompt)
-        json_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_text)
-    except Exception as e:
-        print(f"Failed to analyze code conceptually: {e}")
-        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.'}
-
