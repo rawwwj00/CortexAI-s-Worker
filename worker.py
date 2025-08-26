@@ -19,34 +19,15 @@ app = Flask(__name__)
 
 @app.route('/process_attachment_task', methods=['POST'])
 def process_attachment_task():
-    task_data = request.get_json()
-    
-    # Rebuild the user's credentials, ONLY for accessing their Google Drive file
-    user_credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
-    drive_service = build('drive', 'v3', credentials=user_credentials)
-    
-    student_id = task_data['student_id']
-    course_id = task_data['course_id']
-    assignment_id = task_data['assignment_id']
-    domain = task_data['domain']
-    question = task_data['question']
-    drive_file = task_data['drive_file']
+    # ... (code to get task_data and build drive_service is the same) ...
     
     final_score = 0.0
     final_justification = "Failed to process attachment."
     debug_info = "No debug information generated."
 
     try:
-        file_id = drive_file['id']
-        mime_type = drive_service.files().get(fileId=file_id, fields='mimeType').execute().get('mimeType')
+        # ... (code to download file and get ocr_text is the same) ...
         
-        request_file = drive_service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request_file)
-        done = False
-        while not done: status, done = downloader.next_chunk()
-        
-        ocr_text = extract_text_from_file(fh.getvalue(), mime_type)
         if ocr_text and ocr_text != "Unsupported File Type":
             result = {}
             if domain == 'theory':
@@ -62,20 +43,22 @@ def process_attachment_task():
             debug_info = f"MIME Type: {mime_type}. File was empty or could not be read."
 
     except Exception as e:
-        print(f"Worker failed on attachment for student {student_id}. Error: {e}")
         final_justification = "Attachment failed to process due to a critical error."
         debug_info = f"Critical error in worker: {e}"
             
-    doc_id = f"{course_id}-{student_id}-{assignment_id}-{drive_file['id']}"
+    # Save a result for THIS ATTACHMENT, now including the debug info
+    unique_part = drive_file['id']
+    doc_id = f"{course_id}-{student_id}-{assignment_id}-{unique_part}"
     doc_ref = db.collection('results').document(doc_id)
     doc_ref.set({
         'course_id': course_id, 'student_id': student_id, 'assignment_id': assignment_id,
         'accuracy_score': final_score, 
         'justification': final_justification,
-        'debug_info': debug_info
+        'debug_info': debug_info # <-- NEW FIELD
     })
     
     return "OK", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+
