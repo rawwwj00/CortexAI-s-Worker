@@ -1,97 +1,88 @@
 # worker.py
 import os
-import tempfile
-import docker
-import re  # Make sure 're' is imported for regular expressions
+import io
+import json
+import google.oauth2.credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from flask import Flask, request, jsonify
 
+# --- Local Module Imports ---
+# Make sure these files are on your VM with worker.py
+from utils import extract_text_from_file
+from theory_analyzer import analyze_theory_submission
+from programming_analyzer import analyze_programming_submission
+
+# --- Firestore Initialization ---
+from google.cloud import firestore
+db = firestore.Client(database="cortex-ai")
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("WORKER_SECRET_KEY", "a-default-secret-key")
 
-def run_code_in_docker(code: str, language: str, test_cases: list) -> dict:
+@app.route('/process_task', methods=['POST'])
+def process_task():
     """
-    Executes code in a sandboxed Docker container and checks it against test cases.
+    NEW: This is the main endpoint triggered by Cloud Tasks.
+    It receives submission details, performs the full analysis, and saves to Firestore.
     """
-    try:
-        client = docker.from_env()
-    except docker.errors.DockerException:
-        return {"error": "Docker daemon is not running on the worker VM."}
-
-    passed_count = 0
-    for case in test_cases:
-        sanitized_input = str(case.get('input', '')).replace("'", "'\\''")
-        image, file_name, run_command = "", "", []
-
-        if language == "python":
-            image, file_name = "python:3.9-slim", "student_code.py"
-            run_command = ["sh", "-c", f"echo '{sanitized_input}' | python -u /app/{file_name}"]
-        elif language in ["c++", "c"]:
-            image, file_name = "gcc:latest", f"student_code.{'cpp' if language == 'c++' else 'c'}"
-            run_command = ["sh", "-c", f"g++ /app/{file_name} -o /app/program && echo '{sanitized_input}' | /app/program"]
-        elif language == "java":
-            image, file_name = "openjdk:17-slim-bullseye", "Main.java"
-            run_command = ["sh", "-c", f"javac /app/{file_name} && echo '{sanitized_input}' | java -cp /app Main"]
-        else:
-            continue
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_path = os.path.join(temp_dir, file_name)
-            with open(script_path, "w", encoding="utf-8") as f: f.write(code)
-            
-            try:
-                container_output = client.containers.run(
-                    image,
-                    command=run_command,
-                    volumes={temp_dir: {'bind': '/app', 'mode': 'rw'}},
-                    working_dir="/app", remove=True, network_disabled=True, mem_limit='256m'
-                ).decode('utf-8').strip()
-                
-                expected_output = str(case.get('expected_output', '')).strip()
-
-                # === NEW: Smarter Comparison Logic ===
-                # Find all numbers (including decimals and negatives) in both strings
-                numbers_from_actual = re.findall(r'-?\d+\.?\d*', container_output)
-                numbers_from_expected = re.findall(r'-?\d+\.?\d*', expected_output)
-
-                # 1. Primary Check: If expected output contains numbers, compare the extracted numbers.
-                if numbers_from_expected:
-                    if numbers_from_actual == numbers_from_expected:
-                        passed_count += 1
-                        continue # Move to the next test case
-
-                # 2. Fallback Check: If no numbers are involved, or if the numeric check fails,
-                #    fall back to a case-insensitive string comparison.
-                if container_output.lower() == expected_output.lower():
-                    passed_count += 1
-            
-            except docker.errors.ContainerError as e:
-                print(f"Container error: {e.stderr.decode('utf-8')}")
-                continue
-            except Exception as e:
-                print(f"An unknown execution error occurred: {e}")
-                continue
+    task_data = request.get_json()
     
-    return {"passed_count": passed_count}
-
-@app.route('/execute', methods=['POST'])
-def execute_code():
-    """
-    Flask endpoint to receive code execution requests. It authenticates the
-    request, validates the payload, and calls the Docker execution function.
-    """
-    if request.headers.get('X-Auth-Key') != app.secret_key:
-        return jsonify({"error": "Unauthorized"}), 401
-        
-    data = request.get_json()
-    if not all(k in data for k in ['code', 'language', 'test_cases']):
-        return jsonify({"error": "Missing required fields"}), 400
-
-    result = run_code_in_docker(data['code'], data['language'], data['test_cases'])
+    # Rebuild Google API clients using credentials from the task payload
+    credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
+    drive_service = build('drive', 'v3', credentials=credentials)
     
-    if "error" in result:
-        return jsonify(result), 500
-        
-    return jsonify(result), 200
+    student_id = task_data['student_id']
+    course_id = task_data['course_id']
+    assignment_id = task_data['assignment_id']
+    domain = task_data['domain']
+    question = task_data['question']
+    sub = task_data['submission_details']
+
+    attachments = sub.get('assignmentSubmission', {}).get('attachments', [])
+    total_score, count, justifications = 0.0, 0, []
+
+    for attachment in attachments:
+        try:
+            drive_file = attachment.get('driveFile')
+            if not drive_file: continue
+            
+            file_id = drive_file['id']
+            mime_type = drive_service.files().get(fileId=file_id, fields='mimeType').execute().get('mimeType')
+            
+            request_file = drive_service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request_file)
+            done = False
+            while not done: status, done = downloader.next_chunk()
+            
+            ocr_text = extract_text_from_file(fh.getvalue(), mime_type)
+            if not ocr_text: continue
+            
+            result = {}
+            if domain == 'theory':
+                result = analyze_theory_submission(question, ocr_text)
+            elif domain == 'programming':
+                result = analyze_programming_submission(question, ocr_text)
+            
+            total_score += result.get('score', 0.0)
+            justifications.append(result.get('justification', ''))
+            count += 1
+        except Exception as e:
+            print(f"Worker failed on attachment for student {student_id}. Error: {e}")
+            
+    final_score = total_score / count if count > 0 else 0.0
+    final_justification = " | ".join(justifications) if justifications else "No processable attachments found."
+
+    # Save final result to Firestore
+    doc_id = f"{course_id}-{student_id}-{assignment_id}"
+    doc_ref = db.collection('results').document(doc_id)
+    doc_ref.set({
+        'course_id': course_id, 'student_id': student_id, 'assignment_id': assignment_id,
+        'accuracy_score': final_score, 'justification': final_justification
+    })
+    
+    # Return 200 OK to Cloud Tasks to acknowledge the task is done
+    return "OK", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
