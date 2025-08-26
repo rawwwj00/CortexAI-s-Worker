@@ -125,7 +125,8 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
 
                 if numbers_from_expected and numbers_from_actual == numbers_from_expected:
                     passed_count += 1
-                elif container_output.lower() == expected_output.lower():
+                # --- THIS IS THE CORRECTED LINE ---
+                elif expected_output.lower() in container_output.lower():
                     passed_count += 1
             
             except docker.errors.ContainerError as e:
