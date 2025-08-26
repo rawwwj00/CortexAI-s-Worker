@@ -1,3 +1,5 @@
 Flask
 docker
+google-cloud-firestore
+google-generativeai
 gunicorn
