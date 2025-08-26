@@ -8,7 +8,6 @@ import google.generativeai as genai
 # Configure the Gemini API client at the module level
 try:
     genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    # Using the more powerful model for better analysis
     programming_model = genai.GenerativeModel('gemini-1.5-pro-latest')
 except Exception as e:
     programming_model = None
@@ -28,7 +27,7 @@ def _check_if_code_takes_input(code: str, language: str) -> bool:
         return response.text.strip().lower() == 'yes'
     except Exception as e:
         print(f"Could not check for input: {e}")
-        return True # Default to assuming it takes input if the check fails
+        return True
 
 def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
     """Uses AI to review code that doesn't take input based on its logic and correctness."""
@@ -37,7 +36,7 @@ def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
     This program does not take standard input, so you must evaluate it conceptually.
 
     Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
-    - "score": Grade based on correctness, efficiency, and adherence to the question. A perfect, efficient solution gets 1.0. A non-working or logically flawed solution gets 0.0.
+    - "score": Grade based on correctness, efficiency, and adherence to the question.
     - "justification": A brief, one-sentence explanation for your score.
 
     ---
@@ -52,13 +51,10 @@ def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
     try:
         response = programming_model.generate_content(prompt)
         json_text = response.text.replace("```json", "").replace("```", "").strip()
-        # Add a debug_info key for consistency
-        result = json.loads(json_text)
-        result['debug_info'] = f"Conceptual Analysis Result: {result.get('score', 0)*100}% - {result.get('justification', 'N/A')}"
-        return result
+        return json.loads(json_text)
     except Exception as e:
         print(f"Failed to analyze code conceptually: {e}")
-        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.', 'debug_info': f'Error: {e}'}
+        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.'}
 
 def _detect_language(code: str) -> str:
     """Detects the programming language of the given code snippet."""
@@ -88,17 +84,16 @@ def _generate_test_cases(question: str, language: str) -> list:
         print(f"Failed to generate or parse test cases: {e}")
         return []
 
-def _run_code_in_docker(code: str, language: str, test_cases: list) -> (int, str):
-    """Runs code in Docker, returns passed_count and a detailed debug log string."""
-    debug_log = []
+def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
+    """Runs student code in a sandboxed Docker container with robust checking."""
     try:
         client = docker.from_env()
     except docker.errors.DockerException:
-        return 0, "CRITICAL: Docker daemon is not running on the worker VM."
+        print("CRITICAL: Docker daemon is not running on the worker VM.")
+        return 0
 
     passed_count = 0
-    for j, case in enumerate(test_cases):
-        debug_log.append(f"\n-- Running Test Case {j+1} --")
+    for case in test_cases:
         sanitized_input = str(case.get('input', '')).replace("'", "'\\''")
         image, file_name, run_command = "", "", []
 
@@ -129,31 +124,19 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> (int, str
                 numbers_from_actual = _extract_numbers(container_output)
                 numbers_from_expected = _extract_numbers(expected_output)
                 
-                passed = False
                 if numbers_from_expected and numbers_from_actual == numbers_from_expected:
-                    passed = True
-                elif expected_output.strip().lower() in container_output.strip().lower():
-                    passed = True
-
-                if passed:
                     passed_count += 1
-                    debug_log.append("Result: PASSED")
-                else:
-                    debug_log.append("Result: FAILED")
-                    debug_log.append(f"Input: {case.get('input')}")
-                    debug_log.append(f"Expected Output: '{expected_output.strip()}'")
-                    debug_log.append(f"Actual Output:   '{container_output.strip()}'")
+                elif expected_output.strip().lower() in container_output.strip().lower():
+                    passed_count += 1
             
             except docker.errors.ContainerError as e:
-                debug_log.append(f"Result: FAILED (Container Error)")
-                debug_log.append(f"Error Details: {e.stderr.decode('utf-8')}")
+                print(f"Container error: {e.stderr.decode('utf-8')}")
                 continue
             except Exception as e:
-                debug_log.append(f"Result: FAILED (Unknown Error)")
-                debug_log.append(f"Error Details: {e}")
+                print(f"An unknown execution error occurred: {e}")
                 continue
     
-    return passed_count, '\n'.join(debug_log)
+    return passed_count
 
 def _split_programs(ocr_text: str) -> list:
     if not programming_model or not ocr_text.strip(): return [ocr_text]
@@ -168,26 +151,20 @@ def _split_programs(ocr_text: str) -> list:
 # --- MAIN ANALYSIS FUNCTION (NOW WITH CONDITIONAL LOGIC) ---
 
 def analyze_programming_submission(question: str, ocr_code: str) -> dict:
-    debug_log = []
     if not programming_model or not ocr_code:
-        return {'score': 0.0, 'justification': 'Missing model or student code.', 'debug_info': 'Model or code was empty.'}
+        return {'score': 0.0, 'justification': 'Missing model or student code.'}
 
     programs = _split_programs(ocr_code)
-    debug_log.append(f"Found {len(programs)} program(s) in submission.")
     if not programs:
-        return {'score': 0.0, 'justification': 'No valid programs were found in the submission.', 'debug_info': '\n'.join(debug_log)}
+        return {'score': 0.0, 'justification': 'No valid programs were found in the submission.'}
 
     total_score, all_justifications = 0.0, []
 
     for i, program_code in enumerate(programs):
         justification_prefix = f"P{i+1}"
         try:
-            debug_log.append(f"\n--- Analyzing Program {i+1} ---")
             language = _detect_language(program_code)
-            debug_log.append(f"Language Detected: {language}")
-
             fixed_code = _fix_code(program_code, language)
-            debug_log.append(f"AI-Corrected Code:\n```\n{fixed_code}\n```")
             
             takes_input = _check_if_code_takes_input(fixed_code, language)
             
@@ -195,10 +172,8 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
                 test_cases = _generate_test_cases(question, language)
                 if not test_cases:
                     all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
-                    debug_log.append("Could not generate test cases from AI.")
                     continue
-                passed_cases, test_debug_log = _run_code_in_docker(fixed_code, language, test_cases)
-                debug_log.append(test_debug_log)
+                passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
                 score = passed_cases / len(test_cases) if test_cases else 0.0
                 all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
             else:
@@ -206,15 +181,13 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
                 score = conceptual_result.get('score', 0.0)
                 justification = conceptual_result.get('justification', 'AI analysis failed.')
                 all_justifications.append(f"{justification_prefix}: {justification}")
-                debug_log.append(conceptual_result.get('debug_info', ''))
 
             total_score += score
-            
         except Exception as e:
-            debug_log.append(f"CRITICAL ERROR: {e}")
+            print(f"A critical error occurred during analysis of program {i+1}: {e}")
             all_justifications.append(f"{justification_prefix}: Analysis failed with a critical error.")
             continue
     
     average_score = total_score / len(programs) if programs else 0.0
     final_justification = " | ".join(all_justifications)
-    return {'score': average_score, 'justification': final_justification, 'debug_info': '\n'.join(debug_log)}
+    return {'score': average_score, 'justification': final_justification}
