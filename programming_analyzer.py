@@ -8,50 +8,15 @@ import google.generativeai as genai
 # Configure the Gemini API client at the module level
 try:
     genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    # --- UPGRADED MODEL ---
-    programming_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+    programming_model = genai.GenerativeModel('gemini-1.5-pro-latest') # Using the more powerful model
 except Exception as e:
     programming_model = None
 
-
 # --- HELPER FUNCTIONS (DEFINED FIRST) ---
 
-def _check_if_code_takes_input(code: str, language: str) -> bool:
-    """Uses AI to determine if a code snippet reads from standard input."""
-    prompt = f"Does the following {language} code read from standard input (e.g., using `cin`, `input()`, `Scanner`, `scanf`)? Respond with only the word 'yes' or 'no'."
-    try:
-        response = programming_model.generate_content(prompt)
-        return response.text.strip().lower() == 'yes'
-    except Exception as e:
-        print(f"Could not check for input: {e}")
-        return True # Default to assuming it takes input if the check fails
-
-def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
-    """Uses AI to review code that doesn't take input based on its logic and correctness."""
-    prompt = f"""
-    As an expert programming instructor, your task is to evaluate a student's code based on the assignment question.
-    This program does not take standard input, so you must evaluate it conceptually.
-
-    Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
-    - "score": Grade based on correctness, efficiency, and adherence to the question. A perfect, efficient solution gets 1.0. A non-working or logically flawed solution gets 0.0.
-    - "justification": A brief, one-sentence explanation for your score.
-
-    ---
-    Assignment Question: "{question}"
-    ---
-    Student's {language} Code:
-    ```
-    {code}
-    ```
-    ---
-    """
-    try:
-        response = programming_model.generate_content(prompt)
-        json_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_text)
-    except Exception as e:
-        print(f"Failed to analyze code conceptually: {e}")
-        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.'}
+def _extract_numbers(text: str) -> list:
+    """Finds all integer and floating-point numbers in a string and returns them as a list of strings."""
+    return re.findall(r'-?\d+\.?\d*', text)
 
 def _detect_language(code: str) -> str:
     """Detects the programming language of the given code snippet."""
@@ -117,20 +82,29 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
                 ).decode('utf-8')
                 
                 expected_output = str(case.get('expected_output', ''))
-                
+
+                # --- FINAL, ROBUST CHECKER ---
                 numbers_from_actual = _extract_numbers(container_output)
                 numbers_from_expected = _extract_numbers(expected_output)
                 
                 passed = False
-                if numbers_from_expected and numbers_from_actual == numbers_from_expected:
-                    passed = True
+                # 1. If the expected output contains numbers, the primary check is to see if the lists of numbers match.
+                if numbers_from_expected:
+                    if numbers_from_actual == numbers_from_expected:
+                        passed = True
+                # 2. If no numbers are expected, fall back to a flexible, case-insensitive substring check.
                 elif expected_output.strip().lower() in container_output.strip().lower():
                     passed = True
 
                 if passed:
                     passed_count += 1
                 else:
-                    print(f"--- TEST CASE FAILED ---\nInput: {case.get('input')}\nExpected: '{expected_output.strip()}'\nActual:   '{container_output.strip()}'\n------------------------")
+                    # Detailed logging for failed tests
+                    print("--- TEST CASE FAILED ---")
+                    print(f"Input: {case.get('input')}")
+                    print(f"Expected Output: '{expected_output.strip()}'")
+                    print(f"Actual Output:   '{container_output.strip()}'")
+                    print("------------------------")
             
             except docker.errors.ContainerError as e:
                 print(f"Container error: {e.stderr.decode('utf-8')}")
@@ -154,12 +128,7 @@ def _split_programs(ocr_text: str) -> list:
 
 
 # --- MAIN ANALYSIS FUNCTION (NOW WITH CONDITIONAL LOGIC) ---
-
 def analyze_programming_submission(question: str, ocr_code: str) -> dict:
-    """
-    A fully automated pipeline to analyze a programming submission. Now handles both
-    programs that take input and those that do not.
-    """
     if not programming_model or not ocr_code:
         return {'score': 0.0, 'justification': 'Missing model or student code.'}
 
@@ -174,11 +143,9 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
             language = _detect_language(program_code)
             fixed_code = _fix_code(program_code, language)
             
-            # --- NEW: Check if the code takes input ---
             takes_input = _check_if_code_takes_input(fixed_code, language)
             
             if takes_input:
-                # --- Existing Logic for programs that take input ---
                 test_cases = _generate_test_cases(question, language)
                 if not test_cases:
                     all_justifications.append(f"P{i+1}: Could not generate test cases.")
@@ -187,7 +154,6 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
                 score = passed_cases / len(test_cases) if test_cases else 0.0
                 all_justifications.append(f"P{i+1}: Passed {passed_cases}/{len(test_cases)} tests.")
             else:
-                # --- New Logic for programs that DO NOT take input ---
                 print(f"Program {i+1} does not take input. Analyzing conceptually.")
                 conceptual_result = _analyze_code_conceptually(question, fixed_code, language)
                 score = conceptual_result.get('score', 0.0)
@@ -203,3 +169,42 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     average_score = total_score / program_count if program_count > 0 else 0.0
     final_justification = " | ".join(all_justifications)
     return {'score': average_score, 'justification': final_justification}
+
+# --- NEW CONCEPTUAL ANALYSIS FUNCTIONS ---
+
+def _check_if_code_takes_input(code: str, language: str) -> bool:
+    """Uses AI to determine if a code snippet reads from standard input."""
+    prompt = f"Does the following {language} code read from standard input (e.g., using `cin`, `input()`, `Scanner`, `scanf`)? Respond with only the word 'yes' or 'no'."
+    try:
+        response = programming_model.generate_content(prompt)
+        return response.text.strip().lower() == 'yes'
+    except Exception as e:
+        print(f"Could not check for input: {e}")
+        return True
+
+def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
+    """Uses AI to review code that doesn't take input based on its logic and correctness."""
+    prompt = f"""
+    As an expert programming instructor, your task is to evaluate a student's code based on the assignment question.
+    This program does not take standard input, so you must evaluate it conceptually.
+
+    Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
+    - "score": Grade based on correctness, efficiency, and adherence to the question. A perfect, efficient solution gets 1.0. A non-working or logically flawed solution gets 0.0.
+    - "justification": A brief, one-sentence explanation for your score.
+
+    ---
+    Assignment Question: "{question}"
+    ---
+    Student's {language} Code:
+    ```
+    {code}
+    ```
+    ---
+    """
+    try:
+        response = programming_model.generate_content(prompt)
+        json_text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(json_text)
+    except Exception as e:
+        print(f"Failed to analyze code conceptually: {e}")
+        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.'}
