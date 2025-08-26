@@ -19,15 +19,41 @@ app = Flask(__name__)
 
 @app.route('/process_attachment_task', methods=['POST'])
 def process_attachment_task():
-    # ... (code to get task_data and build drive_service is the same) ...
+    task_data = request.get_json()
     
+    # Get all identifiers first. If any of these are missing, the task will fail and retry.
+    student_id = task_data['student_id']
+    course_id = task_data['course_id']
+    assignment_id = task_data['assignment_id']
+    drive_file = task_data['drive_file']
+    
+    # Define the unique document ID for this attachment's result
+    doc_id = f"{course_id}-{student_id}-{assignment_id}-{drive_file['id']}"
+    doc_ref = db.collection('results').document(doc_id)
+
+    # Set default values in case of failure
     final_score = 0.0
-    final_justification = "Failed to process attachment."
-    debug_info = "No debug information generated."
+    final_justification = "Attachment failed to process due to a critical error."
+    debug_info = "An unexpected error occurred in the worker."
 
     try:
-        # ... (code to download file and get ocr_text is the same) ...
+        # Rebuild user credentials and Drive service inside the try block
+        user_credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
+        drive_service = build('drive', 'v3', credentials=user_credentials)
         
+        domain = task_data['domain']
+        question = task_data['question']
+        file_id = drive_file['id']
+        
+        mime_type = drive_service.files().get(fileId=file_id, fields='mimeType').execute().get('mimeType')
+        
+        request_file = drive_service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request_file)
+        done = False
+        while not done: status, done = downloader.next_chunk()
+        
+        ocr_text = extract_text_from_file(fh.getvalue(), mime_type)
         if ocr_text and ocr_text != "Unsupported File Type":
             result = {}
             if domain == 'theory':
@@ -35,6 +61,7 @@ def process_attachment_task():
             elif domain == 'programming':
                 result = analyze_programming_submission(question, ocr_text)
             
+            # If everything succeeds, update the variables with the good results
             final_score = result.get('score', 0.0)
             final_justification = result.get('justification', 'AI analysis failed.')
             debug_info = result.get('debug_info', 'No debug info from analyzer.')
@@ -43,24 +70,19 @@ def process_attachment_task():
             debug_info = f"MIME Type: {mime_type}. File was empty or could not be read."
 
     except Exception as e:
-        final_justification = "Attachment failed to process due to a critical error."
+        print(f"Worker failed on attachment for student {student_id}. Error: {e}")
+        # The default justification is already set, so we just update the debug info
         debug_info = f"Critical error in worker: {e}"
             
-    # Save a result for THIS ATTACHMENT, now including the debug info
-    unique_part = drive_file['id']
-    doc_id = f"{course_id}-{student_id}-{assignment_id}-{unique_part}"
-    doc_ref = db.collection('results').document(doc_id)
+    # Save the result to Firestore, whether it succeeded or failed
     doc_ref.set({
         'course_id': course_id, 'student_id': student_id, 'assignment_id': assignment_id,
         'accuracy_score': final_score, 
         'justification': final_justification,
-        'debug_info': debug_info # <-- NEW FIELD
+        'debug_info': debug_info
     })
     
     return "OK", 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
-
-
-
