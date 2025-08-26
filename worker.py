@@ -1,15 +1,8 @@
 import os
 import io
 import json
-
-# --- Explicitly use the VM's Service Account for Firestore ---
-from google.cloud import firestore
 import google.auth
-fs_credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/datastore"])
-db = firestore.Client(credentials=fs_credentials, database="cortex-ai")
-
-# --- Use the User's Credentials ONLY for Google Drive/Classroom ---
-import google.oauth2.credentials
+from google.cloud import firestore
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from flask import Flask, request
@@ -19,15 +12,16 @@ from utils import extract_text_from_file
 from theory_analyzer import analyze_theory_submission
 from programming_analyzer import analyze_programming_submission
 
+# --- Initialization ---
+fs_credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/datastore"])
+db = firestore.Client(credentials=fs_credentials, database="cortex-ai")
 app = Flask(__name__)
 
 @app.route('/process_attachment_task', methods=['POST'])
 def process_attachment_task():
-    """
-    This endpoint is triggered by Cloud Tasks to process a single attachment.
-    """
     task_data = request.get_json()
     
+    # Rebuild the user's credentials, ONLY for accessing their Google Drive file.
     user_credentials = google.oauth2.credentials.Credentials(**task_data['credentials'])
     drive_service = build('drive', 'v3', credentials=user_credentials)
     
