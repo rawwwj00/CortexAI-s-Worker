@@ -233,14 +233,15 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
             takes_input = _check_for_input_statically(fixed_code, language)
             
             if takes_input:
-                # DYNAMIC PATH: Generate tests and run in Docker
-                test_cases = _generate_test_cases(question, language)
-                if not test_cases:
-                    all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
-                    continue
-                passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
-                score = passed_cases / len(test_cases) if test_cases else 0.0
-                all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
+                test_cases = _generate_test_cases(question, fixed_code, language)
+    
+            if not test_cases:
+                all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
+                continue
+    
+    passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
+    score = passed_cases / len(test_cases) if test_cases else 0.0
+    all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
             else:
                 # CONCEPTUAL PATH: AI review for non-input code
                 conceptual_result = _analyze_code_conceptually(question, fixed_code, language)
@@ -259,4 +260,5 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     final_justification = " | ".join(all_justifications)
     
     return {'score': average_score, 'justification': final_justification}
+
 
