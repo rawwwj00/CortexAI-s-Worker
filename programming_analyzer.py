@@ -132,7 +132,8 @@ def _perform_holistic_review(question: str, preliminary_results: str) -> dict:
 
     Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
     - "score": A final, overall score based on whether the preliminary results collectively meet all requirements of the question.
-    - "justification": A final, overall summary explaining the score.
+    - "justification": A final, overall summary explaining the score. Please check the question may have multiple parts which analysis engine treated as separate programs which are mentioned as P1 - P2 etc. 
+    so taking that in mind analyze the justification such that P1: result belongs to first part of the question and so on like this.
 
     ---
     Assignment Question:
@@ -193,3 +194,4 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     final_result['debug_info'] = combined_preliminary_results
     
     return final_result
+
