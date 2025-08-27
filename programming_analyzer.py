@@ -10,72 +10,39 @@ try:
     genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
     programming_model = genai.GenerativeModel('gemini-1.5-pro-latest')
 except Exception as e:
-    print(f"CRITICAL: Failed to configure Gemini API. AI features will be disabled. Error: {e}")
     programming_model = None
 
 
-# --- HELPER FUNCTIONS ---
+# --- HELPER FUNCTIONS (DEFINED FIRST) ---
 
-def compare_outputs(actual_output: str, expected_output: str) -> bool:
-    """
-    Compares two program outputs using a multi-stage, robust strategy.
-    Returns True if the outputs are considered equivalent, False otherwise.
-    """
-    # 1. Normalize both strings: remove leading/trailing whitespace and make lowercase.
-    norm_actual = actual_output.strip().lower()
-    norm_expected = expected_output.strip().lower()
+def _extract_numbers(text: str) -> list:
+    """Finds all integer and floating-point numbers in a string and returns them as a list of strings."""
+    return re.findall(r'-?\d+\.?\d*', text)
 
-    # Strategy 1: Exact Match after Normalization
-    if norm_actual == norm_expected:
-        return True
+def _check_if_code_takes_input(code: str, language: str) -> bool:
+    """Uses AI to determine if a code snippet reads from standard input."""
+    prompt = f"Does the following {language} code read from standard input (e.g., using `cin`, `input()`, `Scanner`, `scanf`)? Respond with only the word 'yes' or 'no'."
+    try:
+        response = programming_model.generate_content(prompt)
+        return response.text.strip().lower() == 'yes'
+    except Exception as e:
+        print(f"Could not check for input: {e}")
+        return True # Default to assuming it takes input if the check fails
 
-    # Strategy 2: Compare Extracted Numbers
-    actual_nums = re.findall(r'-?\d+\.?\d*', norm_actual)
-    expected_nums = re.findall(r'-?\d+\.?\d*', norm_expected)
-    if expected_nums and actual_nums == expected_nums:
-        return True
-        
-    # Strategy 3: Lenient Substring Check (Fallback)
-    if norm_expected in norm_actual:
-        return True
-
-    return False
-
-def _check_for_input_statically(code: str, language: str) -> bool:
-    """
-    Statically and reliably checks for standard input keywords.
-    This is much faster and more accurate than using an AI call.
-    """
-    language = language.lower()
-    input_keywords = {
-        "python": ["input("],
-        "java": ["new Scanner(System.in)", "System.in.read"],
-        "c++": ["std::cin", "cin >>", "scanf"],
-        "c": ["scanf", "getchar"]
-    }
-    
-    if language in input_keywords:
-        for keyword in input_keywords[language]:
-            if keyword in code:
-                return True
-    return False
-
-def _split_submission_into_parts(question: str, code: str) -> list:
-    """
-    Uses AI to intelligently split a single code submission into a list of separate
-    implementations based on the requirements of the assignment question.
-    """
+def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
+    """Uses AI to review code that doesn't take input based on its logic and correctness."""
     prompt = f"""
-    Based on the assignment question, the student was required to provide multiple function implementations.
-    Analyze the student's code and split it into a list of strings, where each string is a complete, runnable program
-    representing one of the required implementations.
+    As an expert programming instructor, your task is to evaluate a student's code based on the assignment question.
+    This program does not take standard input, so you must evaluate it conceptually.
 
-    Provide your response as a single, valid JSON object with one key: "programs". The value should be a list of code strings.
+    Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
+    - "score": Grade based on correctness, efficiency, and adherence to the question. A perfect, efficient solution gets 1.0. A non-working or logically flawed solution gets 0.0.
+    - "justification": A brief, one-sentence explanation for your score.
 
     ---
     Assignment Question: "{question}"
     ---
-    Student's Code:
+    Student's {language} Code:
     ```
     {code}
     ```
@@ -84,29 +51,60 @@ def _split_submission_into_parts(question: str, code: str) -> list:
     try:
         response = programming_model.generate_content(prompt)
         json_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_text).get("programs", [code])
+        result = json.loads(json_text)
+        result['debug_info'] = f"Conceptual Analysis Result: {result.get('score', 0)*100}% - {result.get('justification', 'N/A')}"
+        return result
     except Exception as e:
-        print(f"AI could not split submission into parts, analyzing as a whole. Error: {e}")
-        return [code]
+        print(f"Failed to analyze code conceptually: {e}")
+        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.', 'debug_info': f'Error: {e}'}
 
-def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
-    """Runs student code in a sandboxed Docker container and checks outputs."""
+def _detect_language(code: str) -> str:
+    """Detects the programming language of the given code snippet."""
+    prompt = f"Detect the programming language of the following code. Respond with a single word only from this list: Python, Java, C, C++. \n\nCode:\n```\n{code}\n```"
+    response = programming_model.generate_content(prompt)
+    return response.text.strip().lower()
+
+def _fix_code(code: str, language: str) -> str:
+    """Corrects OCR'd code using an AI model and cleans the output."""
+    prompt = f"The following {language} code was extracted from an image using OCR and may contain errors. Please correct it so it is a runnable program. Provide only the corrected code with no explanations.\n\nOCR'd Code:\n```\n{code}\n```"
+    response = programming_model.generate_content(prompt)
+    cleaned_text = response.text.strip()
+    if cleaned_text.startswith("```"):
+        cleaned_text = cleaned_text[cleaned_text.find('\n') + 1:]
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text[:-3].strip()
+    return cleaned_text
+
+def _generate_test_cases(question: str, language: str) -> list:
+    """Generates test cases as a JSON object for a given question."""
+    prompt = f'Based on the following programming question, generate a list of 5 diverse test cases. Provide your response as a single, valid JSON object. The object should be a list of dictionaries, where each dictionary has "input" and "expected_output".\n\nQuestion: "{question}"'
+    try:
+        response = programming_model.generate_content(prompt)
+        json_text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(json_text)
+    except Exception as e:
+        print(f"Failed to generate or parse test cases: {e}")
+        return []
+
+def _run_code_in_docker(code: str, language: str, test_cases: list) -> (int, str):
+    """Runs code in Docker, returns passed_count and a detailed debug log string."""
+    debug_log = []
     try:
         client = docker.from_env()
     except docker.errors.DockerException:
-        print("CRITICAL: Docker daemon is not running on the worker VM.")
-        return 0
+        return 0, "CRITICAL: Docker daemon is not running on the worker VM."
 
     passed_count = 0
-    for case in test_cases:
+    for j, case in enumerate(test_cases):
+        debug_log.append(f"\n-- Running Test Case {j+1} --")
         sanitized_input = str(case.get('input', '')).replace("'", "'\\''")
         image, file_name, run_command = "", "", []
 
         if language == "python":
-            image, file_name = "python:3.9-slim", "script.py"
+            image, file_name = "python:3.9-slim", "student_code.py"
             run_command = ["sh", "-c", f"echo '{sanitized_input}' | python -u /app/{file_name}"]
         elif language in ["c++", "c"]:
-            image, file_name = "gcc:latest", f"program.{'cpp' if language == 'c++' else 'c'}"
+            image, file_name = "gcc:latest", f"student_code.{'cpp' if language == 'c++' else 'c'}"
             run_command = ["sh", "-c", f"g++ /app/{file_name} -o /app/program && echo '{sanitized_input}' | /app/program"]
         elif language == "java":
             image, file_name = "openjdk:17-slim-bullseye", "Main.java"
@@ -120,121 +118,85 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
             
             try:
                 container_output = client.containers.run(
-                    image, 
-                    command=run_command, 
-                    volumes={temp_dir: {'bind': '/app', 'mode': 'ro'}}, # SECURITY: Mount as read-only
-                    working_dir="/app", 
-                    remove=True, 
-                    network_disabled=True, 
-                    mem_limit='256m'
+                    image, command=run_command, volumes={temp_dir: {'bind': '/app', 'mode': 'rw'}},
+                    working_dir="/app", remove=True, network_disabled=True, mem_limit='256m'
                 ).decode('utf-8')
                 
-                # Use the robust comparison function
-                if compare_outputs(container_output, str(case.get('expected_output', ''))):
+                expected_output = str(case.get('expected_output', ''))
+                
+                numbers_from_actual = _extract_numbers(container_output)
+                numbers_from_expected = _extract_numbers(expected_output)
+                
+                passed = False
+                if numbers_from_expected and numbers_from_actual == numbers_from_expected:
+                    passed = True
+                elif expected_output.strip().lower() in container_output.strip().lower():
+                    passed = True
+
+                if passed:
                     passed_count += 1
+                    debug_log.append("Result: PASSED")
+                else:
+                    debug_log.append("Result: FAILED")
+                    debug_log.append(f"Input: {case.get('input')}")
+                    debug_log.append(f"Expected Output: '{expected_output.strip()}'")
+                    debug_log.append(f"Actual Output:   '{container_output.strip()}'")
             
             except docker.errors.ContainerError as e:
-                print(f"Container runtime error: {e.stderr.decode('utf-8')}")
+                debug_log.append(f"Result: FAILED (Container Error)")
+                debug_log.append(f"Error Details: {e.stderr.decode('utf-8')}")
                 continue
             except Exception as e:
-                print(f"An unknown Docker execution error occurred: {e}")
+                debug_log.append(f"Result: FAILED (Unknown Error)")
+                debug_log.append(f"Error Details: {e}")
                 continue
     
-    return passed_count
+    return passed_count, '\n'.join(debug_log)
 
-def _detect_language(code: str) -> str:
-    prompt = f"Detect the programming language of the following code. Respond with a single word only from this list: Python, Java, C, C++. \n\nCode:\n```\n{code}\n```"
-    response = programming_model.generate_content(prompt)
-    return response.text.strip().lower()
-
-def _fix_code(code: str, language: str) -> str:
-    prompt = f"The following {language} code was extracted from an image using OCR and may contain errors. Please correct it so it is a runnable program. Provide only the corrected code with no explanations.\n\nOCR'd Code:\n```\n{code}\n```"
-    response = programming_model.generate_content(prompt)
-    cleaned_text = response.text.strip()
-    if cleaned_text.startswith("```"):
-        cleaned_text = cleaned_text[cleaned_text.find('\n') + 1:]
-    if cleaned_text.endswith("```"):
-        cleaned_text = cleaned_text[:-3].strip()
-    return cleaned_text
-    
-def _generate_test_cases(question: str, code_snippet: str, language: str) -> list:
-    """
-    Generates test cases for a specific code snippet, using the overall question for context.
-    """
-    prompt = f'''
-    You are a test case generator for a single function. Based on the provided {language} code snippet and the original assignment question, generate 5 diverse test cases. The code reads from standard input. 
-    
-    Provide your response as a single, valid JSON object. The object should be a list of dictionaries, where each dictionary has an "input" key and an "expected_output" key.
-
-    ---
-    Original Assignment Question: "{question}"
-    ---
-    Code Snippet to Test:
-    ```
-    {code_snippet}
-    ```
-    ---
-    '''
+def _split_programs(ocr_text: str) -> list:
+    if not programming_model or not ocr_text.strip(): return [ocr_text]
+    prompt = f'The following text may contain one or more distinct computer programs. Separate each complete program into a JSON list of strings under the key "programs". If no valid code is found, return an empty list.\n\nSubmission Text:\n"{ocr_text}"'
     try:
         response = programming_model.generate_content(prompt)
         json_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_text)
-    except Exception as e:
-        print(f"Failed to generate or parse test cases: {e}")
-        return []
-        
-def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
-    prompt = f"""
-    As an expert programming instructor, your task is to evaluate a student's code based on the assignment question.
-    This program does not take standard input, so you must evaluate it conceptually.
+        return json.loads(json_text).get("programs", [])
+    except Exception:
+        return [ocr_text]
 
-    Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
-    - "score": Grade based on correctness, efficiency, and adherence to the question.
-    - "justification": A brief, one-sentence explanation for your score.
-    ---
-    Assignment Question: "{question}"
-    ---
-    Student's {language} Code:
-    ```
-    {code}
-    ```
-    ---
-    """
-    try:
-        response = programming_model.generate_content(prompt)
-        json_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_text)
-    except Exception as e:
-        print(f"Failed to analyze code conceptually: {e}")
-        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.'}
-
-# --- MAIN ANALYSIS FUNCTION ---
+# --- MAIN ANALYSIS FUNCTION (NOW WITH CONDITIONAL LOGIC) ---
 
 def analyze_programming_submission(question: str, ocr_code: str) -> dict:
+    debug_log = []
     if not programming_model or not ocr_code:
-        return {'score': 0.0, 'justification': 'Missing Gemini model or student code.'}
+        return {'score': 0.0, 'justification': 'Missing model or student code.', 'debug_info': 'Model or code was empty.'}
 
-    program_parts = _split_submission_into_parts(question, ocr_code)
-    if not program_parts:
-        return {'score': 0.0, 'justification': 'No valid programs were found in the submission.'}
+    programs = _split_programs(ocr_code)
+    debug_log.append(f"Found {len(programs)} program(s) in submission.")
+    if not programs:
+        return {'score': 0.0, 'justification': 'No valid programs were found in the submission.', 'debug_info': '\n'.join(debug_log)}
 
     total_score, all_justifications = 0.0, []
 
-    for i, program_code in enumerate(program_parts):
-        justification_prefix = f"Part {i+1}"
-        
+    for i, program_code in enumerate(programs):
+        justification_prefix = f"P{i+1}"
         try:
+            debug_log.append(f"\n--- Analyzing Program {i+1} ---")
             language = _detect_language(program_code)
+            debug_log.append(f"Language Detected: {language}")
+
             fixed_code = _fix_code(program_code, language)
+            debug_log.append(f"AI-Corrected Code:\n```\n{fixed_code}\n```")
             
-            takes_input = _check_for_input_statically(fixed_code, language)
+            takes_input = _check_if_code_takes_input(fixed_code, language)
             
             if takes_input:
-                test_cases = _generate_test_cases(question, fixed_code, language)
+                test_cases = _generate_test_cases(question, language)
                 if not test_cases:
                     all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
+                    debug_log.append("Could not generate test cases from AI.")
                     continue
-                passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
+                passed_cases, test_debug_log = _run_code_in_docker(fixed_code, language, test_cases)
+                debug_log.append(test_debug_log)
                 score = passed_cases / len(test_cases) if test_cases else 0.0
                 all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
             else:
@@ -242,15 +204,15 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
                 score = conceptual_result.get('score', 0.0)
                 justification = conceptual_result.get('justification', 'AI analysis failed.')
                 all_justifications.append(f"{justification_prefix}: {justification}")
+                debug_log.append(conceptual_result.get('debug_info', ''))
 
             total_score += score
-
+            
         except Exception as e:
-            print(f"A critical error occurred during analysis of program part {i+1}: {e}")
+            debug_log.append(f"CRITICAL ERROR: {e}")
             all_justifications.append(f"{justification_prefix}: Analysis failed with a critical error.")
             continue
     
-    average_score = total_score / len(program_parts) if program_parts else 0.0
+    average_score = total_score / len(programs) if programs else 0.0
     final_justification = " | ".join(all_justifications)
-    
-    return {'score': average_score, 'justification': final_justification}
+    return {'score': average_score, 'justification': final_justification, 'debug_info': '\n'.join(debug_log)}
