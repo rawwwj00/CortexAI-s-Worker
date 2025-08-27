@@ -1,20 +1,153 @@
 import os
 import json
+import re
+import docker
+import tempfile
 import google.generativeai as genai
 
 # Configure the Gemini API client at the module level
 try:
     genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-    # Using the most powerful model for the best analysis
     programming_model = genai.GenerativeModel('gemini-1.5-pro-latest')
 except Exception as e:
+    print(f"CRITICAL: Failed to configure Gemini API. AI features will be disabled. Error: {e}")
     programming_model = None
 
 
 # --- HELPER FUNCTIONS ---
 
+def compare_outputs(actual_output: str, expected_output: str) -> bool:
+    """
+    Compares two program outputs using a multi-stage, robust strategy.
+    Returns True if the outputs are considered equivalent, False otherwise.
+    """
+    # 1. Normalize both strings: remove leading/trailing whitespace and make lowercase.
+    norm_actual = actual_output.strip().lower()
+    norm_expected = expected_output.strip().lower()
+
+    # Strategy 1: Exact Match after Normalization
+    if norm_actual == norm_expected:
+        return True
+
+    # Strategy 2: Compare Extracted Numbers
+    actual_nums = re.findall(r'-?\d+\.?\d*', norm_actual)
+    expected_nums = re.findall(r'-?\d+\.?\d*', norm_expected)
+    if expected_nums and actual_nums == expected_nums:
+        return True
+        
+    # Strategy 3: Lenient Substring Check (Fallback)
+    if norm_expected in norm_actual:
+        return True
+
+    return False
+
+def _check_for_input_statically(code: str, language: str) -> bool:
+    """
+    Statically and reliably checks for standard input keywords.
+    This is much faster and more accurate than using an AI call.
+    """
+    language = language.lower()
+    input_keywords = {
+        "python": ["input("],
+        "java": ["new Scanner(System.in)", "System.in.read"],
+        "c++": ["std::cin", "cin >>", "scanf"],
+        "c": ["scanf", "getchar"]
+    }
+    
+    if language in input_keywords:
+        for keyword in input_keywords[language]:
+            if keyword in code:
+                return True
+    return False
+
+def _split_submission_into_parts(question: str, code: str) -> list:
+    """
+    Uses AI to intelligently split a single code submission into a list of separate
+    implementations based on the requirements of the assignment question.
+    """
+    prompt = f"""
+    Based on the assignment question, the student was required to provide multiple function implementations.
+    Analyze the student's code and split it into a list of strings, where each string is a complete, runnable program
+    representing one of the required implementations.
+
+    Provide your response as a single, valid JSON object with one key: "programs". The value should be a list of code strings.
+
+    ---
+    Assignment Question: "{question}"
+    ---
+    Student's Code:
+    ```
+    {code}
+    ```
+    ---
+    """
+    try:
+        response = programming_model.generate_content(prompt)
+        json_text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(json_text).get("programs", [code])
+    except Exception as e:
+        print(f"AI could not split submission into parts, analyzing as a whole. Error: {e}")
+        return [code]
+
+def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
+    """Runs student code in a sandboxed Docker container and checks outputs."""
+    try:
+        client = docker.from_env()
+    except docker.errors.DockerException:
+        print("CRITICAL: Docker daemon is not running on the worker VM.")
+        return 0
+
+    passed_count = 0
+    for case in test_cases:
+        sanitized_input = str(case.get('input', '')).replace("'", "'\\''")
+        image, file_name, run_command = "", "", []
+
+        if language == "python":
+            image, file_name = "python:3.9-slim", "script.py"
+            run_command = ["sh", "-c", f"echo '{sanitized_input}' | python -u /app/{file_name}"]
+        elif language in ["c++", "c"]:
+            image, file_name = "gcc:latest", f"program.{'cpp' if language == 'c++' else 'c'}"
+            run_command = ["sh", "-c", f"g++ /app/{file_name} -o /app/program && echo '{sanitized_input}' | /app/program"]
+        elif language == "java":
+            image, file_name = "openjdk:17-slim-bullseye", "Main.java"
+            run_command = ["sh", "-c", f"javac /app/{file_name} && echo '{sanitized_input}' | java -cp /app Main"]
+        else:
+            continue
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, file_name)
+            with open(script_path, "w", encoding="utf-8") as f: f.write(code)
+            
+            try:
+                container_output = client.containers.run(
+                    image, 
+                    command=run_command, 
+                    volumes={temp_dir: {'bind': '/app', 'mode': 'ro'}}, # SECURITY: Mount as read-only
+                    working_dir="/app", 
+                    remove=True, 
+                    network_disabled=True, 
+                    mem_limit='256m'
+                ).decode('utf-8')
+                
+                # Use the robust comparison function
+                if compare_outputs(container_output, str(case.get('expected_output', ''))):
+                    passed_count += 1
+            
+            except docker.errors.ContainerError as e:
+                print(f"Container runtime error: {e.stderr.decode('utf-8')}")
+                continue
+            except Exception as e:
+                print(f"An unknown Docker execution error occurred: {e}")
+                continue
+    
+    return passed_count
+
+def _detect_language(code: str) -> str:
+    prompt = f"Detect the programming language of the following code. Respond with a single word only from this list: Python, Java, C, C++. \n\nCode:\n```\n{code}\n```"
+    response = programming_model.generate_content(prompt)
+    return response.text.strip().lower()
+
 def _fix_code(code: str, language: str) -> str:
-    """Corrects OCR'd code using an AI model and cleans the output."""
     prompt = f"The following {language} code was extracted from an image using OCR and may contain errors. Please correct it so it is a runnable program. Provide only the corrected code with no explanations.\n\nOCR'd Code:\n```\n{code}\n```"
     response = programming_model.generate_content(prompt)
     cleaned_text = response.text.strip()
@@ -23,82 +156,101 @@ def _fix_code(code: str, language: str) -> str:
     if cleaned_text.endswith("```"):
         cleaned_text = cleaned_text[:-3].strip()
     return cleaned_text
+    
+def _generate_test_cases(question: str, code_snippet: str, language: str) -> list:
+    """
+    Generates test cases for a specific code snippet, using the overall question for context.
+    """
+    prompt = f'''
+    You are a test case generator for a single function. Based on the provided {language} code snippet and the original assignment question, generate 5 diverse test cases. The code reads from standard input. 
+    
+    Provide your response as a single, valid JSON object. The object should be a list of dictionaries, where each dictionary has an "input" key and an "expected_output" key.
 
-def _split_programs(ocr_text: str) -> list:
-    """Uses the AI model to identify and separate multiple programs from a single block of text."""
-    if not programming_model or not ocr_text.strip(): return [ocr_text]
-    prompt = f'The following text may contain one or more distinct computer programs. Separate each complete program into a JSON list of strings under the key "programs".\n\nSubmission Text:\n"{ocr_text}"'
+    ---
+    Original Assignment Question: "{question}"
+    ---
+    Code Snippet to Test:
+    ```
+    {code_snippet}
+    ```
+    ---
+    '''
     try:
         response = programming_model.generate_content(prompt)
         json_text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_text).get("programs", [])
-    except Exception:
-        return [ocr_text]
-
-
-# --- FINAL, HOLISTIC ANALYSIS FUNCTION ---
-
-def analyze_programming_submission(question: str, ocr_code: str) -> dict:
-    """
-    Analyzes a programming submission holistically, evaluating all provided code
-    against the full set of requirements in the assignment question.
-    """
-    debug_log = []
-    if not programming_model or not ocr_code:
-        return {'score': 0.0, 'justification': 'Missing model or student code.', 'debug_info': 'Model or code was empty.'}
-
-    # Step 1: Split the submission into individual programs
-    programs = _split_programs(ocr_code)
-    debug_log.append(f"Found {len(programs)} program(s) in submission.")
-    if not programs:
-        return {'score': 0.0, 'justification': 'No valid programs were found.', 'debug_info': '\n'.join(debug_log)}
-
-    # Step 2: Correct each program and build a combined code block for analysis
-    corrected_programs = []
-    for i, program_code in enumerate(programs):
-        try:
-            # For this type of question, we can assume a consistent language (e.g., C++)
-            fixed_code = _fix_code(program_code, "c++")
-            corrected_programs.append(f"--- Program {i+1} ---\n{fixed_code}\n")
-        except Exception as e:
-            debug_log.append(f"Could not correct Program {i+1}: {e}")
-            continue
-    
-    combined_code = "\n".join(corrected_programs)
-    debug_log.append(f"Combined and Corrected Code for Analysis:\n{combined_code}")
-
-    # Step 3: Perform a single, holistic analysis of all the code
+        return json.loads(json_text)
+    except Exception as e:
+        print(f"Failed to generate or parse test cases: {e}")
+        return []
+        
+def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
     prompt = f"""
-    As an expert Computer Science professor, your task is to grade a student's submission.
-    The student was asked to provide multiple C++ programs to fulfill several requirements.
-    You must evaluate their entire submission holistically.
+    As an expert programming instructor, your task is to evaluate a student's code based on the assignment question.
+    This program does not take standard input, so you must evaluate it conceptually.
 
-    Provide your response as a single, valid JSON object with "score" and "justification".
-    - "score": A float from 0.0 to 1.0. The score should be 1.0 only if all requirements from the question are met correctly across all the provided programs. Give partial credit if some, but not all, requirements are met.
-    - "justification": A brief, overall summary of the student's submission, explaining the reason for the score.
-
+    Provide your response as a single, valid JSON object with "score" (a float from 0.0 to 1.0) and "justification".
+    - "score": Grade based on correctness, efficiency, and adherence to the question.
+    - "justification": A brief, one-sentence explanation for your score.
     ---
-    Assignment Question:
-    "{question}"
+    Assignment Question: "{question}"
     ---
-    Student's Entire Submission (all programs combined):
-    ```cpp
-    {combined_code}
+    Student's {language} Code:
+    ```
+    {code}
     ```
     ---
     """
     try:
         response = programming_model.generate_content(prompt)
         json_text = response.text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(json_text)
-        # Pass the debug log through to the final result
-        result['debug_info'] = '\n'.join(debug_log)
-        return result
-
+        return json.loads(json_text)
     except Exception as e:
-        debug_log.append(f"Holistic analysis failed: {e}")
-        return {
-            'score': 0.0,
-            'justification': 'The AI failed to perform a holistic analysis of the submission.',
-            'debug_info': '\n'.join(debug_log)
-        }
+        print(f"Failed to analyze code conceptually: {e}")
+        return {'score': 0.0, 'justification': 'AI conceptual analysis failed.'}
+
+# --- MAIN ANALYSIS FUNCTION ---
+
+def analyze_programming_submission(question: str, ocr_code: str) -> dict:
+    if not programming_model or not ocr_code:
+        return {'score': 0.0, 'justification': 'Missing Gemini model or student code.'}
+
+    program_parts = _split_submission_into_parts(question, ocr_code)
+    if not program_parts:
+        return {'score': 0.0, 'justification': 'No valid programs were found in the submission.'}
+
+    total_score, all_justifications = 0.0, []
+
+    for i, program_code in enumerate(program_parts):
+        justification_prefix = f"Part {i+1}"
+        
+        try:
+            language = _detect_language(program_code)
+            fixed_code = _fix_code(program_code, language)
+            
+            takes_input = _check_for_input_statically(fixed_code, language)
+            
+            if takes_input:
+                test_cases = _generate_test_cases(question, fixed_code, language)
+                if not test_cases:
+                    all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
+                    continue
+                passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
+                score = passed_cases / len(test_cases) if test_cases else 0.0
+                all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
+            else:
+                conceptual_result = _analyze_code_conceptually(question, fixed_code, language)
+                score = conceptual_result.get('score', 0.0)
+                justification = conceptual_result.get('justification', 'AI analysis failed.')
+                all_justifications.append(f"{justification_prefix}: {justification}")
+
+            total_score += score
+
+        except Exception as e:
+            print(f"A critical error occurred during analysis of program part {i+1}: {e}")
+            all_justifications.append(f"{justification_prefix}: Analysis failed with a critical error.")
+            continue
+    
+    average_score = total_score / len(program_parts) if program_parts else 0.0
+    final_justification = " | ".join(all_justifications)
+    
+    return {'score': average_score, 'justification': final_justification}
