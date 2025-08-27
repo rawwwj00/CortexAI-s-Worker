@@ -142,7 +142,6 @@ def _run_code_in_docker(code: str, language: str, test_cases: list) -> int:
     
     return passed_count
 
-# --- (Other AI helper functions: _detect_language, _fix_code, etc. remain the same) ---
 def _detect_language(code: str) -> str:
     prompt = f"Detect the programming language of the following code. Respond with a single word only from this list: Python, Java, C, C++. \n\nCode:\n```\n{code}\n```"
     response = programming_model.generate_content(prompt)
@@ -224,7 +223,6 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     for i, program_code in enumerate(program_parts):
         justification_prefix = f"Part {i+1}"
         
-        # This 'try' block was missing its 'except'
         try:
             language = _detect_language(program_code)
             fixed_code = _fix_code(program_code, language)
@@ -247,7 +245,6 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
 
             total_score += score
 
-        # ✅ THIS IS THE MISSING BLOCK THAT NEEDS TO BE ADDED
         except Exception as e:
             print(f"A critical error occurred during analysis of program part {i+1}: {e}")
             all_justifications.append(f"{justification_prefix}: Analysis failed with a critical error.")
@@ -257,5 +254,3 @@ def analyze_programming_submission(question: str, ocr_code: str) -> dict:
     final_justification = " | ".join(all_justifications)
     
     return {'score': average_score, 'justification': final_justification}
-
-
