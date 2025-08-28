@@ -17,8 +17,8 @@ fs_credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth
 db = firestore.Client(credentials=fs_credentials, database="cortex-ai")
 app = Flask(__name__)
 
-@app.route('/process_attachment_task', methods=['POST'])
-def process_attachment_task():
+@app.route('/process_task', methods=['POST'])
+def process_task():
     task_data = request.get_json()
     
     student_id = task_data['student_id']
@@ -83,3 +83,4 @@ def process_attachment_task():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+
