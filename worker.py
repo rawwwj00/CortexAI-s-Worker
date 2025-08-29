@@ -6,6 +6,7 @@ import json
 import hashlib
 import logging
 import string
+import traceback
 from typing import List, Dict, Optional
 
 from flask import Flask, request, jsonify
@@ -43,7 +44,10 @@ def split_question_into_parts(question: str) -> List[str]:
     lines = [l.rstrip() for l in question.splitlines() if l.strip()]
     parts = []
     current = []
-    marker_regex = re.compile(r'^\s*(?:P?\s?\d+[:.\)]|Part\s*\d+[:.\)]|\([a-zA-Z0-9]\)|[a-zA-Z]\)|Q\d+[:.\)])', re.IGNORECASE)
+    marker_regex = re.compile(
+        r'^\s*(?:P?\s?\d+[:.\)]|Part\s*\d+[:.\)]|\([a-zA-Z0-9]\)|[a-zA-Z]\)|Q\d+[:.\)])',
+        re.IGNORECASE
+    )
     for line in lines:
         if marker_regex.match(line):
             if current:
@@ -59,14 +63,31 @@ def split_question_into_parts(question: str) -> List[str]:
     parts = [p for p in parts if p]
     return parts if parts else [question.strip()]
 
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'ok'}), 200
 
-@app.route('/process_task', methods=['POST'])
-def process_task():
-    payload = request.get_json(force=True)
-    logger.info("Task payload keys: %s", list(payload.keys()))
+
+@app.route('/task', methods=['POST'])
+def handle_task():
+    """Main entrypoint for task execution."""
+    try:
+        payload = request.get_json(force=True)
+        logger.info("Task payload keys: %s", list(payload.keys()))
+
+        result, status = run_task_logic(payload)
+        return jsonify(result), status
+
+    except Exception as e:
+        logger.error(f"Task failed with error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+def run_task_logic(payload: dict):
+    """Core analysis logic that can be called without Flask context."""
+
     student_id = payload.get('student_id')
     course_id = payload.get('course_id')
     assignment_id = payload.get('assignment_id')
@@ -76,11 +97,12 @@ def process_task():
     credentials_info = payload.get('credentials')
 
     if not (student_id and course_id and assignment_id and credentials_info is not None):
-        return jsonify({'error': 'Missing required fields'}), 400
+        return {'error': 'Missing required fields'}, 400
 
     doc_id = f"{course_id}-{student_id}-{assignment_id}"
     doc_ref = db.collection('results').document(doc_id)
 
+    # Authenticate with Google Drive
     try:
         creds = google.oauth2.credentials.Credentials(**credentials_info)
         drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
@@ -95,7 +117,7 @@ def process_task():
             'file_hashes': [],
             'is_plagiarized': False
         })
-        return jsonify({'error': 'drive auth failed'}), 500
+        return {'error': 'drive auth failed'}, 500
 
     if len(attachments) == 0:
         doc_ref.set({
@@ -108,8 +130,9 @@ def process_task():
             'file_hashes': [],
             'is_plagiarized': False
         })
-        return jsonify({'status': 'no_attachments'}), 200
+        return {'status': 'no_attachments'}, 200
 
+    # Download attachments & extract text
     ocr_texts = []
     file_hashes = []
     attachment_names = []
@@ -160,18 +183,17 @@ def process_task():
             'file_hashes': file_hashes,
             'is_plagiarized': False
         })
-        return jsonify({'error': 'download_failed'}), 500
+        return {'error': 'download_failed'}, 500
 
-    # exact-file plagiarism
+    # Plagiarism check (exact file)
     try:
         for fhash in file_hashes:
             q = (
-    db.collection('results')
-    .where(filter={"field_path": "assignment_id", "op_string": "==", "value": assignment_id})
-    .where(filter={"field_path": "file_hashes", "op_string": "array_contains", "value": fhash})
-    .limit(1)
-)
-
+                db.collection('results')
+                .where(filter={"field_path": "assignment_id", "op_string": "==", "value": assignment_id})
+                .where(filter={"field_path": "file_hashes", "op_string": "array_contains", "value": fhash})
+                .limit(1)
+            )
             docs = list(q.stream())
             if docs:
                 prev = docs[0].to_dict()
@@ -183,18 +205,21 @@ def process_task():
                         'assignment_id': assignment_id,
                         'accuracy_score': 0.0,
                         'justification': 'Plagiarism detected (exact file match).',
-                        'debug_info': json.dumps({'matched_student': prev_student, 'matched_doc_id': docs[0].id, 'matched_hash': fhash}),
+                        'debug_info': json.dumps({
+                            'matched_student': prev_student,
+                            'matched_doc_id': docs[0].id,
+                            'matched_hash': fhash
+                        }),
                         'file_hashes': file_hashes,
                         'is_plagiarized': True
                     })
-                    return jsonify({'status': 'plagiarism_detected'}), 200
+                    return {'status': 'plagiarism_detected'}, 200
     except Exception:
         pass
 
-    # map attachments to parts
+    # Map question parts to attachments
     question_parts = split_question_into_parts(question)
     num_parts = len(question_parts)
-
     mapping = {}
     if len(ocr_texts) == num_parts:
         for i in range(num_parts):
@@ -212,20 +237,25 @@ def process_task():
                     best_j = j
             mapping[i] = best_j
 
+    # Run analyzers
     part_results: Dict[int, dict] = {}
     part_sources: Dict[int, Optional[int]] = {}
-
     for att_idx, part_idx in mapping.items():
         try:
             ocr_text = ocr_texts[att_idx]
             if not ocr_text.strip():
-                result = {'score': 0.0, 'justification': f'Attachment {attachment_names[att_idx] if att_idx < len(attachment_names) else att_idx}: OCR empty.'}
+                result = {'score': 0.0, 'justification': f'Attachment {attachment_names[att_idx]}: OCR empty.'}
             else:
                 if domain == 'theory':
-                    result = analyze_theory_submission(question_parts[part_idx] if part_idx < len(question_parts) else question, ocr_text)
+                    result = analyze_theory_submission(
+                        question_parts[part_idx] if part_idx < len(question_parts) else question,
+                        ocr_text
+                    )
                 else:
-                    # programming analyzer expects a single-part question and the code blob for that attachment
-                    result = analyze_programming_submission(question_parts[part_idx] if part_idx < len(question_parts) else question, ocr_text)
+                    result = analyze_programming_submission(
+                        question_parts[part_idx] if part_idx < len(question_parts) else question,
+                        ocr_text
+                    )
         except Exception as e:
             result = {'score': 0.0, 'justification': f'Analyzer error: {e}'}
         score = float(result.get('score', 0.0))
@@ -253,7 +283,8 @@ def process_task():
 
     final_justification = " | ".join(per_part_justifications)
 
-    payload = {
+    # Save result in Firestore
+    payload_out = {
         'course_id': course_id,
         'student_id': student_id,
         'assignment_id': assignment_id,
@@ -265,13 +296,12 @@ def process_task():
         'is_plagiarized': False
     }
     try:
-        doc_ref.set(payload)
+        doc_ref.set(payload_out)
     except Exception as e:
-        return jsonify({'error': 'db_write_failed', 'detail': str(e)}), 500
+        return {'error': 'db_write_failed', 'detail': str(e)}, 500
 
-    return jsonify({'status': 'processed', 'score': final_score}), 200
+    return {'status': 'processed', 'score': final_score}, 200
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
-
-
