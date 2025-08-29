@@ -165,7 +165,13 @@ def process_task():
     # exact-file plagiarism
     try:
         for fhash in file_hashes:
-            q = db.collection('results').where('assignment_id', '==', assignment_id).where('file_hashes', 'array_contains', fhash).limit(1)
+            q = (
+    db.collection('results')
+    .where(filter={"field_path": "assignment_id", "op_string": "==", "value": assignment_id})
+    .where(filter={"field_path": "file_hashes", "op_string": "array_contains", "value": fhash})
+    .limit(1)
+)
+
             docs = list(q.stream())
             if docs:
                 prev = docs[0].to_dict()
@@ -267,4 +273,5 @@ def process_task():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
+
 
