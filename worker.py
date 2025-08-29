@@ -19,17 +19,24 @@ from programming_analyzer import analyze_programming_submission
 from theory_analyzer import analyze_theory_submission
 from utils import extract_text_from_file
 
+
+# ----------------- Logging -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ----------------- Firestore -----------------
 db = firestore.Client()
+
+# ----------------- Flask -----------------
 app = Flask(__name__)
 
+# ----------------- Stopwords -----------------
 _STOPWORDS = set([
     'the','a','an','and','or','to','of','in','on','for','with','by','from',
     'that','this','it','is','are','as','be','your','student','write','implement','print'
 ])
 
+# ----------------- Helpers -----------------
 def token_set(text: str) -> set:
     if not text:
         return set()
@@ -60,33 +67,16 @@ def split_question_into_parts(question: str) -> List[str]:
         parts.append(" ".join(current).strip())
     if len(parts) <= 1:
         return [question.strip()]
-    parts = [p for p in parts if p]
-    return parts if parts else [question.strip()]
+    return [p for p in parts if p] or [question.strip()]
 
-
+# ----------------- Routes -----------------
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'ok'}), 200
 
 
-@app.route('/task', methods=['POST'])
-def handle_task():
-    """Main entrypoint for task execution."""
-    try:
-        payload = request.get_json(force=True)
-        logger.info("Task payload keys: %s", list(payload.keys()))
-
-        result, status = run_task_logic(payload)
-        return jsonify(result), status
-
-    except Exception as e:
-        logger.error(f"Task failed with error: {e}")
-        logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-def run_task_logic(payload: dict):
-    """Core analysis logic that can be called without Flask context."""
+def run_task_logic(payload: dict) -> dict:
+    logger.info("Task payload keys: %s", list(payload.keys()))
 
     student_id = payload.get('student_id')
     course_id = payload.get('course_id')
@@ -97,16 +87,19 @@ def run_task_logic(payload: dict):
     credentials_info = payload.get('credentials')
 
     if not (student_id and course_id and assignment_id and credentials_info is not None):
+        logger.error("Missing required fields in payload")
         return {'error': 'Missing required fields'}, 400
 
     doc_id = f"{course_id}-{student_id}-{assignment_id}"
     doc_ref = db.collection('results').document(doc_id)
 
-    # Authenticate with Google Drive
+    # ----------------- Drive Auth -----------------
     try:
         creds = google.oauth2.credentials.Credentials(**credentials_info)
         drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
     except Exception as e:
+        logger.error(f"Drive auth failed: {e}")
+        logger.error(traceback.format_exc())
         doc_ref.set({
             'course_id': course_id,
             'student_id': student_id,
@@ -120,6 +113,7 @@ def run_task_logic(payload: dict):
         return {'error': 'drive auth failed'}, 500
 
     if len(attachments) == 0:
+        logger.warning("No attachments found for assignment %s", assignment_id)
         doc_ref.set({
             'course_id': course_id,
             'student_id': student_id,
@@ -132,10 +126,8 @@ def run_task_logic(payload: dict):
         })
         return {'status': 'no_attachments'}, 200
 
-    # Download attachments & extract text
-    ocr_texts = []
-    file_hashes = []
-    attachment_names = []
+    # ----------------- Download Attachments -----------------
+    ocr_texts, file_hashes, attachment_names = [], [], []
     try:
         for att in attachments:
             drive_file = att.get('driveFile') or att.get('drive_file') or att
@@ -145,6 +137,7 @@ def run_task_logic(payload: dict):
                 file_id = drive_file.get('id')
                 file_title = drive_file.get('title') or drive_file.get('name')
             if not file_id:
+                logger.warning("Attachment missing file_id, skipping: %s", att)
                 continue
 
             request_media = drive_service.files().get_media(fileId=file_id)
@@ -163,16 +156,21 @@ def run_task_logic(payload: dict):
                 mime_type = meta.get('mimeType')
                 if not file_title:
                     file_title = meta.get('name')
-            except Exception:
+            except Exception as e:
+                logger.error(f"Metadata fetch failed for {file_id}: {e}")
                 mime_type = None
 
             try:
                 text = extract_text_from_file(file_bytes, mime_type)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Text extraction failed for {file_title}: {e}")
+                logger.error(traceback.format_exc())
                 text = ""
             ocr_texts.append(text)
             attachment_names.append(file_title or f"file_{file_id}")
     except Exception as e:
+        logger.error(f"Attachment download failed: {e}")
+        logger.error(traceback.format_exc())
         doc_ref.set({
             'course_id': course_id,
             'student_id': student_id,
@@ -185,7 +183,7 @@ def run_task_logic(payload: dict):
         })
         return {'error': 'download_failed'}, 500
 
-    # Plagiarism check (exact file)
+    # ----------------- Exact File Plagiarism -----------------
     try:
         for fhash in file_hashes:
             q = (
@@ -199,6 +197,7 @@ def run_task_logic(payload: dict):
                 prev = docs[0].to_dict()
                 prev_student = prev.get('student_id')
                 if prev_student and prev_student != student_id:
+                    logger.warning("Plagiarism detected: %s matches %s", student_id, prev_student)
                     doc_ref.set({
                         'course_id': course_id,
                         'student_id': student_id,
@@ -214,12 +213,14 @@ def run_task_logic(payload: dict):
                         'is_plagiarized': True
                     })
                     return {'status': 'plagiarism_detected'}, 200
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Plagiarism check failed: {e}")
+        logger.error(traceback.format_exc())
 
-    # Map question parts to attachments
+    # ----------------- Match Attachments to Question Parts -----------------
     question_parts = split_question_into_parts(question)
     num_parts = len(question_parts)
+
     mapping = {}
     if len(ocr_texts) == num_parts:
         for i in range(num_parts):
@@ -228,23 +229,25 @@ def run_task_logic(payload: dict):
         q_tokens = [token_set(qp) for qp in question_parts]
         for i, txt in enumerate(ocr_texts):
             p_tokens = token_set(txt)
-            best_j = 0
-            best_score = -1.0
+            best_j, best_score = 0, -1.0
             for j, qt in enumerate(q_tokens):
                 score = len(p_tokens & qt) / max(1, len(qt)) if qt else 0.0
                 if score > best_score:
-                    best_score = score
-                    best_j = j
+                    best_score, best_j = score, j
             mapping[i] = best_j
 
-    # Run analyzers
+    # ----------------- Analyze Submissions -----------------
     part_results: Dict[int, dict] = {}
     part_sources: Dict[int, Optional[int]] = {}
+
     for att_idx, part_idx in mapping.items():
         try:
             ocr_text = ocr_texts[att_idx]
             if not ocr_text.strip():
-                result = {'score': 0.0, 'justification': f'Attachment {attachment_names[att_idx]}: OCR empty.'}
+                result = {
+                    'score': 0.0,
+                    'justification': f'Attachment {attachment_names[att_idx]} OCR empty.'
+                }
             else:
                 if domain == 'theory':
                     result = analyze_theory_submission(
@@ -257,17 +260,22 @@ def run_task_logic(payload: dict):
                         ocr_text
                     )
         except Exception as e:
+            logger.error(f"Analyzer failed for attachment {att_idx}: {e}")
+            logger.error(traceback.format_exc())
             result = {'score': 0.0, 'justification': f'Analyzer error: {e}'}
+
         score = float(result.get('score', 0.0))
         if part_idx not in part_results or score > float(part_results[part_idx].get('score', 0.0)):
             part_results[part_idx] = result
             part_sources[part_idx] = att_idx
 
+    # ----------------- Fill Missing Parts -----------------
     for j in range(num_parts):
         if j not in part_results:
             part_results[j] = {'score': 0.0, 'justification': f'Part {j+1}: No submission found.'}
             part_sources[j] = None
 
+    # ----------------- Final Score -----------------
     part_scores = [float(part_results[j].get('score', 0.0)) for j in range(num_parts)]
     final_score = (sum(part_scores) / len(part_scores)) if part_scores else 0.0
 
@@ -283,8 +291,7 @@ def run_task_logic(payload: dict):
 
     final_justification = " | ".join(per_part_justifications)
 
-    # Save result in Firestore
-    payload_out = {
+    result_payload = {
         'course_id': course_id,
         'student_id': student_id,
         'assignment_id': assignment_id,
@@ -295,13 +302,30 @@ def run_task_logic(payload: dict):
         'file_hashes': file_hashes,
         'is_plagiarized': False
     }
+
     try:
-        doc_ref.set(payload_out)
+        doc_ref.set(result_payload)
     except Exception as e:
+        logger.error(f"Firestore write failed: {e}")
+        logger.error(traceback.format_exc())
         return {'error': 'db_write_failed', 'detail': str(e)}, 500
 
+    logger.info(f"Task completed: {student_id}-{assignment_id}, score={final_score}")
     return {'status': 'processed', 'score': final_score}, 200
 
 
+@app.route('/task', methods=['POST'])
+def handle_task():
+    try:
+        payload = request.get_json(force=True)
+        result, status = run_task_logic(payload)
+        return jsonify(result), status
+    except Exception as e:
+        logger.error(f"Task failed: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+# ----------------- Main -----------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
