@@ -4,6 +4,8 @@ import re
 import docker
 import tempfile
 import google.generativeai as genai
+from collections import defaultdict
+import string
 
 # Configure the Gemini API client at the module level
 try:
@@ -13,8 +15,49 @@ except Exception as e:
     print(f"CRITICAL: Failed to configure Gemini API. AI features will be disabled. Error: {e}")
     programming_model = None
 
-
+_STOPWORDS = {
+    'the','a','an','and','or','to','of','in','on','for','with','by','from',
+    'that','this','these','those','it','is','are','as','be','your','student',
+    'write','implement','print'
+}
 # --- HELPER FUNCTIONS ---
+def _token_set(text: str):
+    text = text.lower()
+    text = text.translate(str.maketrans(string.punctuation, ' '*len(string.punctuation)))
+    toks = [t for t in text.split() if t and t not in _STOPWORDS]
+    return set(toks)
+
+def split_question_into_parts(question: str) -> list:
+    """
+    Attempts to split an assignment question into subparts (P1, (a), 1., A), etc).
+    If no clear splits found, returns a single-element list [question].
+    """
+    if not question or not question.strip():
+        return [question]
+
+    # Common part markers e.g. "P1:", "1.", "(a)", "a)", "Part 1:", "Q1:", "P.1", "P1 -"
+    pattern = re.compile(r'(^|\n)\s*(?:P?\s?\d+[:.\)]|Part\s*\d+[:.\)]|\([a-zA-Z0-9]\)|[a-zA-Z]\)|Q\d+[:.\)])', re.IGNORECASE)
+    matches = list(pattern.finditer(question))
+    if not matches:
+        # Also try splitting by lines that look like separate tasks (lines starting with '-') or '---'
+        lines = [l.strip() for l in question.splitlines() if l.strip()]
+        if len(lines) > 1:
+            return [" ".join(lines)]
+        return [question]
+
+    parts = []
+    spans = [m.start() for m in matches] + [len(question)]
+    for i in range(len(matches)):
+        start = matches[i].start()
+        end = spans[i+1]
+        part_text = question[start:end].strip()
+        # cleanup leading numbering
+        part_text = re.sub(r'^\s*(?:P?\s?\d+[:.\)]|Part\s*\d+[:.\)]|\([a-zA-Z0-9]\)|[a-zA-Z]\)|Q\d+[:.\)])\s*', '', part_text, flags=re.IGNORECASE)
+        parts.append(part_text.strip())
+    # filter very short blanks
+    parts = [p for p in parts if p]
+    return parts if parts else [question]
+
 
 def compare_outputs(actual_output: str, expected_output: str) -> bool:
     """
@@ -211,46 +254,106 @@ def _analyze_code_conceptually(question: str, code: str, language: str) -> dict:
 # --- MAIN ANALYSIS FUNCTION ---
 
 def analyze_programming_submission(question: str, ocr_code: str) -> dict:
+    """
+    Improved analysis: parse question into parts, split student's submission into program parts,
+    map programs to question parts, score each part separately, count missing parts as zero.
+    Returns {'score': average_score (0..1), 'justification': '...'}
+    """
     if not programming_model or not ocr_code:
         return {'score': 0.0, 'justification': 'Missing Gemini model or student code.'}
 
+    # 1) identify question parts
+    question_parts = split_question_into_parts(question)
+    if not question_parts:
+        question_parts = [question]
+
+    # 2) split student's submission into candidate programs (AI-based fallback)
     program_parts = _split_submission_into_parts(question, ocr_code)
     if not program_parts:
         return {'score': 0.0, 'justification': 'No valid programs were found in the submission.'}
 
-    total_score, all_justifications = 0.0, []
+    # 3) map each program to the best matching question part using token overlap
+    q_tokens = [ _token_set(qp) for qp in question_parts ]
+    program_tokens = [ _token_set(p) for p in program_parts ]
 
-    for i, program_code in enumerate(program_parts):
-        justification_prefix = f"Part {i+1}"
-        
+    # similarity scores matrix
+    sim_matrix = [[len(program_tokens[i] & q_tokens[j]) / max(1, len(q_tokens[j])) for j in range(len(question_parts))] for i in range(len(program_parts))]
+
+    # Greedy assignment: prefer best program->question matches, but allow at most one program per question part.
+    assigned = {}   # question_index -> program_index
+    program_assigned = {}  # program_index -> question_index
+    # Flatten all pairs and sort by score desc
+    pairs = []
+    for i in range(len(program_parts)):
+        for j in range(len(question_parts)):
+            pairs.append((sim_matrix[i][j], i, j))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+
+    for score, pi, qi in pairs:
+        if pi in program_assigned or qi in assigned:
+            continue
+        # threshold: only accept if there is at least some token overlap, otherwise leave unmapped
+        if score >= 0.05:
+            assigned[qi] = pi
+            program_assigned[pi] = qi
+
+    # remaining unmapped programs (low-similarity) will be placed into unmatched bucket
+    unmatched_program_indices = [i for i in range(len(program_parts)) if i not in program_assigned]
+
+    # If there are still unassigned question parts and we have unmatched programs, assign them (best-effort)
+    qi_list_unassigned = [qi for qi in range(len(question_parts)) if qi not in assigned]
+    for qi, pi in zip(qi_list_unassigned, unmatched_program_indices):
+        assigned[qi] = pi
+        program_assigned[pi] = qi
+
+    # 4) grade per question part
+    part_scores = [0.0] * len(question_parts)
+    part_justifications = ['No submission for this part.'] * len(question_parts)
+    debug_notes = []
+
+    # To handle duplicates mapping to same qi (shouldn't happen after assignment), we will handle only one per qi.
+    for qi in range(len(question_parts)):
+        if qi not in assigned:
+            # explicit 0 for missing part
+            part_scores[qi] = 0.0
+            part_justifications[qi] = f"Part {qi+1}: No submission found for this required part."
+            continue
+
+        pi = assigned[qi]
+        program_code = program_parts[pi]
+        justification_prefix = f"Part {qi+1}"
+
         try:
             language = _detect_language(program_code)
             fixed_code = _fix_code(program_code, language)
-            
             takes_input = _check_for_input_statically(fixed_code, language)
-            
+
             if takes_input:
-                test_cases = _generate_test_cases(question, fixed_code, language)
+                test_cases = _generate_test_cases(question_parts[qi], fixed_code, language)
                 if not test_cases:
-                    all_justifications.append(f"{justification_prefix}: Could not generate test cases.")
+                    part_scores[qi] = 0.0
+                    part_justifications[qi] = f"{justification_prefix}: Could not generate test cases for this specific part."
                     continue
                 passed_cases = _run_code_in_docker(fixed_code, language, test_cases)
                 score = passed_cases / len(test_cases) if test_cases else 0.0
-                all_justifications.append(f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests.")
+                part_scores[qi] = score
+                part_justifications[qi] = f"{justification_prefix}: Passed {passed_cases}/{len(test_cases)} tests."
             else:
-                conceptual_result = _analyze_code_conceptually(question, fixed_code, language)
-                score = conceptual_result.get('score', 0.0)
-                justification = conceptual_result.get('justification', 'AI analysis failed.')
-                all_justifications.append(f"{justification_prefix}: {justification}")
-
-            total_score += score
+                conceptual_result = _analyze_code_conceptually(question_parts[qi], fixed_code, language)
+                score = float(conceptual_result.get('score', 0.0))
+                justification = conceptual_result.get('justification', 'AI conceptual analysis failed.')
+                part_scores[qi] = score
+                part_justifications[qi] = f"{justification_prefix}: {justification}"
 
         except Exception as e:
-            print(f"A critical error occurred during analysis of program part {i+1}: {e}")
-            all_justifications.append(f"{justification_prefix}: Analysis failed with a critical error.")
+            part_scores[qi] = 0.0
+            part_justifications[qi] = f"{justification_prefix}: Analysis failed with error: {e}"
+            debug_notes.append(str(e))
             continue
-    
-    average_score = total_score / len(program_parts) if program_parts else 0.0
-    final_justification = " | ".join(all_justifications)
-    
-    return {'score': average_score, 'justification': final_justification}
+
+    average_score = sum(part_scores) / len(part_scores) if part_scores else 0.0
+    final_justification = " | ".join(part_justifications)
+    debug_info = " | ".join(debug_notes) if debug_notes else ""
+
+    return {'score': average_score, 'justification': final_justification, 'debug_info': debug_info}
+
