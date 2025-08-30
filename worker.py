@@ -314,7 +314,7 @@ def run_task_logic(payload: dict) -> dict:
     return {'status': 'processed', 'score': final_score}, 200
 
 
-@app.route('/task', methods=['POST'])
+@app.route('/process_task', methods=['POST'])
 def handle_task():
     try:
         payload = request.get_json(force=True)
@@ -334,4 +334,5 @@ def handle_task():
 # ----------------- Main -----------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
+
 
