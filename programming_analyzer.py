@@ -1,402 +1,316 @@
-# programming_analyzer.py
-"""
-Deterministic programming analyzer for a single question-part + OCR'd code blob.
-
-Public function:
-  analyze_programming_submission(question: str, ocr_code: str) -> dict
-Returns dict with keys:
-  - score: float between 0.0 and 1.0
-  - justification: short human-readable string
-  - details: optional dict with debug/test info
-"""
-
+# worker.py
 import os
+import io
 import re
 import json
-import tempfile
-import shutil
+import hashlib
+import logging
 import string
-from typing import List, Dict, Tuple, Optional
+import traceback
+from typing import List, Dict, Optional
 
-# docker is optional; if not installed the analyzer will fall back to conceptual scoring for stdin programs
-try:
-    import docker
-    _DOCKER_AVAILABLE = True
-except Exception:
-    docker = None
-    _DOCKER_AVAILABLE = False
+from flask import Flask, request, jsonify
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import google.oauth2.credentials
+from google.cloud import firestore
 
-# ---------------------------
-# Small utilities
-# ---------------------------
+from programming_analyzer import analyze_programming_submission
+from theory_analyzer import analyze_theory_submission
+from utils import extract_text_from_file
+
+
+# ----------------- Setup -----------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("worker")
+
+db = firestore.Client()
+app = Flask(__name__)
+
 _STOPWORDS = set([
     'the','a','an','and','or','to','of','in','on','for','with','by','from',
     'that','this','it','is','are','as','be','your','student','write','implement','print'
 ])
 
-def _token_set(text: str) -> set:
+
+# ----------------- Helpers -----------------
+def token_set(text: str) -> set:
     if not text:
         return set()
     t = text.lower()
-    # replace punctuation with spaces
-    t = t.translate(str.maketrans(string.punctuation, ' ' * len(string.punctuation)))
+    t = t.translate(str.maketrans(string.punctuation, ' '*len(string.punctuation)))
     toks = [w for w in t.split() if w and w not in _STOPWORDS]
     return set(toks)
 
-# ---------------------------
-# Heuristic splitting of OCR blob into candidate programs
-# ---------------------------
-def _split_submission_into_parts(question: str, code_blob: str) -> List[str]:
-    """
-    Heuristic splitting:
-      - split by obvious separators (---, ###, ====, '--- Page Break ---')
-      - split by multiple blank lines
-      - as a last resort return the whole blob as single candidate
-    """
-    if not code_blob or not code_blob.strip():
-        return []
 
-    separators = [r'\n-{3,}\n', r'\n#{3,}\n', r'\n={3,}\n', r'--- Page Break ---', r'FILE_BREAK', r'--- FILE BREAK ---']
-    for sep in separators:
-        parts = re.split(sep, code_blob, flags=re.IGNORECASE)
-        parts = [p.strip() for p in parts if p and p.strip()]
-        if len(parts) > 1:
-            return parts
+def split_question_into_parts(question: str) -> List[str]:
+    if not question or not question.strip():
+        return [question or ""]
+    lines = [l.rstrip() for l in question.splitlines() if l.strip()]
+    parts = []
+    current = []
+    marker_regex = re.compile(
+        r'^\s*(?:P?\s?\d+[:.\)]|Part\s*\d+[:.\)]|\([a-zA-Z0-9]\)|[a-zA-Z]\)|Q\d+[:.\)])',
+        re.IGNORECASE
+    )
+    for line in lines:
+        if marker_regex.match(line):
+            if current:
+                parts.append(" ".join(current).strip())
+            cleaned = re.sub(marker_regex, '', line).strip()
+            current = [cleaned]
+        else:
+            current.append(line)
+    if current:
+        parts.append(" ".join(current).strip())
+    if len(parts) <= 1:
+        return [question.strip()]
+    parts = [p for p in parts if p]
+    return parts if parts else [question.strip()]
 
-    # split by two or more newlines (paragraph separation)
-    parts = [p.strip() for p in re.split(r'\n\s*\n', code_blob) if p.strip()]
-    if len(parts) > 1:
-        return parts
 
-    # try to split when multiple 'def ' (python) or 'int main' (c/c++) occurrences exist
-    if code_blob.count('\ndef ') >= 2 or code_blob.count('\nclass ') >= 2:
-        blocks = [b.strip() for b in re.split(r'\n\s*\n', code_blob) if b.strip()]
-        if len(blocks) > 1:
-            return blocks
+# ----------------- Routes -----------------
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok'}), 200
 
-    if code_blob.lower().count('int main') + code_blob.lower().count('main(') >= 2:
-        blocks = [b.strip() for b in re.split(r'\n\s*\n', code_blob) if b.strip()]
-        if len(blocks) > 1:
-            return blocks
 
-    # fallback: single program
-    return [code_blob.strip()]
-
-# ---------------------------
-# Language detection heuristics
-# ---------------------------
-def _detect_language(code: str) -> str:
-    """
-    Return one of: 'python', 'java', 'c++', 'c'
-    Defaults to 'python' when ambiguous.
-    """
-    if not code:
-        return 'python'
-    lower = code.lower()
-    # common tokens
-    if re.search(r'\b(def|print\(|import\b|:\s*$)', lower):
-        return 'python'
-    if 'public static void main' in lower or 'system.out.println' in lower:
-        return 'java'
-    if '#include' in lower and ('std::' in lower or 'iostream' in lower or 'cin >>' in lower):
-        return 'c++'
-    if '#include' in lower and ('scanf(' in lower or 'printf(' in lower) and 'std::' not in lower:
-        return 'c'
-    # fallback default
-    return 'python'
-
-# ---------------------------
-# Simple OCR cleanup (fix common OCR mistakes)
-# ---------------------------
-def _fix_code_simple(code: str) -> str:
-    if not code:
-        return code
-    # common OCR substitutions
-    fixes = [
-        (r'ﬁ', 'fi'),
-        (r'ﬂ', 'fl'),
-        (r'“|”', '"'),
-        (r'‘|’', "'"),
-        (r'—', '-'),
-        (r'–', '-'),
-        (r'‚', ','),
-    ]
-    cleaned = code
-    for pat, rep in fixes:
-        cleaned = re.sub(pat, rep, cleaned)
-    # remove stray non-ascii (but keep common whitespace and punctuation)
-    cleaned = ''.join(ch for ch in cleaned if (31 < ord(ch) < 127) or ch in '\n\t\r')
-    return cleaned
-
-# ---------------------------
-# Detect whether program expects stdin
-# ---------------------------
-def _has_stdin(code: str, language: str) -> bool:
-    language = (language or '').lower()
-    if language == 'python':
-        return 'input(' in code or 'sys.stdin' in code
-    if language == 'java':
-        return 'scanner(' in code.lower() or 'system.in' in code.lower()
-    if language in ('c++', 'c'):
-        return any(tok in code for tok in ['scanf(', 'cin >>', 'gets(', 'fgets(', 'read('])
-    # default heuristic
-    return bool(re.search(r'\b(input|scanf|cin|readline|gets|Scanner)\b', code))
-
-# ---------------------------
-# Generate simple deterministic test cases for a single-part question
-# ---------------------------
-def _generate_test_cases_simple(question: str, language: str) -> List[Dict[str,str]]:
-    """
-    A tiny deterministic test-case generator:
-      - If question mentions sum/add/multiply/average -> create small integer cases
-      - If question mentions palindrome/string -> use string cases
-      - If nothing detected -> return a couple generic cases
-    Returns list of { "input": "...", "expected_output": "..." }.
-    IMPORTANT: expected_output is a best-effort guess and may not match complex problems.
-    """
-    q = (question or "").lower()
-    cases = []
-    if any(k in q for k in ['sum', 'add', 'plus', 'addition', 'total']):
-        cases = [
-            {"input": "2 3", "expected_output": "5"},
-            {"input": "0 5", "expected_output": "5"},
-            {"input": "-1 5", "expected_output": "4"}
-        ]
-    elif any(k in q for k in ['multiply', 'product', 'times']):
-        cases = [
-            {"input": "2 3", "expected_output": "6"},
-            {"input": "0 5", "expected_output": "0"},
-            {"input": "-1 4", "expected_output": "-4"}
-        ]
-    elif any(k in q for k in ['palindrome', 'reverse', 'string']):
-        cases = [
-            {"input": "madam", "expected_output": "YES"},
-            {"input": "hello", "expected_output": "NO"},
-            {"input": "level", "expected_output": "YES"}
-        ]
-    else:
-        # generic numeric cases and a simple single input case
-        cases = [
-            {"input": "2 3", "expected_output": ""},   # unknown expected output; running tests will still attempt
-            {"input": "5", "expected_output": ""},
-        ]
-    # limit to 5
-    return cases[:5]
-
-# ---------------------------
-# Helper to compare outputs loosely
-# ---------------------------
-def _compare_outputs(actual: str, expected: str) -> bool:
-    if actual is None:
-        actual = ''
-    if expected is None:
-        expected = ''
-    a = actual.strip()
-    e = expected.strip()
-    if a == e:
-        return True
-    # compare numeric tokens
-    a_nums = re.findall(r'-?\d+\.?\d*', a)
-    e_nums = re.findall(r'-?\d+\.?\d*', e)
-    if e_nums and a_nums == e_nums:
-        return True
-    # case-insensitive containment
-    if e.lower() in a.lower() or a.lower() in e.lower():
-        return True
-    return False
-
-# ---------------------------
-# Run code in Docker (best-effort)
-# ---------------------------
-def _run_code_in_docker(code: str, language: str, test_cases: List[Dict[str,str]]) -> Tuple[int,int,List[Dict]]:
-    """
-    Attempts to run each test case in a secure docker container.
-    Returns (passed_count, total_count, details_list).
-    If docker not available, returns (0, total, []) and a note in details.
-    """
-    total = len(test_cases)
-    passed = 0
-    details = []
-
-    if total == 0:
-        return 0, 0, details
-
-    if not _DOCKER_AVAILABLE:
-        # can't run tests; return zeros and details explaining why
-        for tc in test_cases:
-            details.append({"input": tc.get("input"), "expected": tc.get("expected_output"), "actual": None, "status": "docker_unavailable"})
-        return 0, total, details
-
-    client = docker.from_env(timeout=60)
-
-    for tc in test_cases:
-        inp = str(tc.get('input', ''))
-        expected = str(tc.get('expected_output', '')).strip()
-
-        with tempfile.TemporaryDirectory() as td:
-            # prepare file and image+commands
-            if language == 'python':
-                fname = "prog.py"
-                with open(os.path.join(td, fname), "w", encoding="utf-8") as f:
-                    f.write(code)
-                image = "python:3.9-slim"
-                # pipe input using printf; use sh -c to allow pipe
-                cmd = ["sh", "-c", f"printf %s {json.dumps(inp)} | python /app/{fname}"]
-            elif language in ('c++', 'c'):
-                ext = "cpp" if language == 'c++' else 'c'
-                fname = f"prog.{ext}"
-                with open(os.path.join(td, fname), "w", encoding="utf-8") as f:
-                    f.write(code)
-                image = "gcc:12"  # should exist on Docker Hub
-                # compile then run (ignore compile errors, attempt to run)
-                cmd = ["sh", "-c", f"g++ /app/{fname} -o /app/program 2>/dev/null || true; printf %s {json.dumps(inp)} | /app/program"]
-            elif language == 'java':
-                fname = "Main.java"
-                with open(os.path.join(td, fname), "w", encoding="utf-8") as f:
-                    f.write(code)
-                image = "openjdk:17-slim"
-                cmd = ["sh", "-c", f"javac /app/{fname} 2>/dev/null || true; printf %s {json.dumps(inp)} | java -cp /app Main"]
-            else:
-                # unsupported language; mark as skipped
-                details.append({"input": inp, "expected": expected, "actual": None, "status": "unsupported_language"})
-                continue
-
-            try:
-                out = client.containers.run(
-                    image=image,
-                    command=cmd,
-                    volumes={td: {'bind': '/app', 'mode': 'ro'}},
-                    working_dir="/app",
-                    remove=True,
-                    network_disabled=True,
-                    stdout=True,
-                    stderr=True,
-                    mem_limit='512m'
-                )
-                actual = out.decode('utf-8', errors='ignore') if isinstance(out, (bytes, bytearray)) else str(out)
-                ok = _compare_outputs(actual, expected) if expected else True  # if expected blank, accept actual as pass (best-effort)
-                details.append({"input": inp, "expected": expected, "actual": actual.strip(), "status": "pass" if ok else "fail"})
-                if ok:
-                    passed += 1
-            except Exception as e:
-                details.append({"input": inp, "expected": expected, "actual": str(e), "status": "error"})
-                # continue with next test
-                continue
-
-    return passed, total, details
-
-# ---------------------------
-# Conceptual analysis fallback (no docker or non-stdin programs)
-# ---------------------------
-def _conceptual_score(question: str, code: str, language: str) -> Tuple[float, str]:
-    """
-    Simple heuristics:
-      - If question mentions 'function' or expects multiple variants, check for function definitions and return/params
-      - Look for keywords: 'def', 'return', 'void', parameter patterns like '(x)' or 'int x'
-    Produces a score between 0 and 1 and a short justification.
-    """
-    q = (question or "").lower()
-    c = (code or "").lower()
-
-    # basic checks
-    has_def = bool(re.search(r'\bdef\s+\w+\s*\(', c)) or bool(re.search(r'\bfunction\b', c))
-    has_return = 'return ' in c or re.search(r'\breturn\b', c)
-    has_params = bool(re.search(r'\(\s*[a-zA-Z0-9_]+\s*[,)]', c)) or bool(re.search(r'\(\s*\)', c)) == False and '(' in c
-
-    # build score
-    score = 0.0
-    reasons = []
-    if has_def or 'class ' in c or 'int main' in c or 'public static' in c:
-        score += 0.4
-        reasons.append('contains function/main')
-    if has_return:
-        score += 0.3
-        reasons.append('uses return')
-    if has_params:
-        score += 0.2
-        reasons.append('contains parameters')
-    # small bonus for longer code (not too small)
-    if len(c.splitlines()) > 3:
-        score += 0.1
-
-    # clamp
-    score = max(0.0, min(1.0, score))
-    justification = f"Conceptual check — {'; '.join(reasons) if reasons else 'no clear functions/returns/params found'}."
-    return score, justification
-
-# ---------------------------
-# Public function
-# ---------------------------
-def analyze_programming_submission(question: str, ocr_code: str) -> Dict:
-    """
-    Analyze an OCR'd code blob for a single question part.
-    Returns a dict: { 'score': float, 'justification': str, 'details': {...} }
-    """
-    details = {}
+@app.route('/process_task', methods=['POST'])
+def process_task():
+    """Main Cloud Task handler"""
     try:
-        if not ocr_code or not ocr_code.strip():
-            return {'score': 0.0, 'justification': 'No code extracted from submission.', 'details': details}
+        payload = request.get_json(force=True)
+        logger.info("PROCESS_TASK CALLED with keys: %s", list(payload.keys()))
 
-        # 1) split into candidate programs
-        candidates = _split_submission_into_parts(question, ocr_code)
-        details['candidate_count'] = len(candidates)
+        student_id = payload.get('student_id')
+        course_id = payload.get('course_id')
+        assignment_id = payload.get('assignment_id')
+        domain = (payload.get('domain') or 'programming').lower()
+        question = payload.get('question', '')
+        attachments = payload.get('attachments', []) or []
+        credentials_info = payload.get('credentials')
 
-        # 2) pick best candidate by token overlap with question
-        q_tokens = _token_set(question)
-        best_idx = 0
-        best_score = -1.0
-        for i, cand in enumerate(candidates):
-            tok = _token_set(cand)
-            if q_tokens:
-                score = len(tok & q_tokens) / max(1, len(q_tokens))
-            else:
-                # if question tokens empty, prefer longer candidate
-                score = min(1.0, len(cand.split()) / 200.0)
-            # slight preference for longer candidates to avoid tiny fragments
-            score += min(0.001 * len(cand.split()), 0.02)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-        selected = candidates[best_idx]
-        details['selected_candidate_index'] = best_idx
-        details['token_overlap_score'] = float(best_score)
+        if not (student_id and course_id and assignment_id and credentials_info is not None):
+            return jsonify({'error': 'Missing required fields'}), 400
 
-        # 3) clean code
-        fixed = _fix_code_simple(selected)
-        details['selected_length_chars'] = len(fixed)
+        doc_id = f"{course_id}-{student_id}-{assignment_id}"
+        doc_ref = db.collection('results').document(doc_id)
 
-        # 4) detect language
-        lang = _detect_language(fixed)
-        details['language'] = lang
+        # ----------------- Drive Auth -----------------
+        try:
+            creds = google.oauth2.credentials.Credentials(**credentials_info)
+            drive_service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        except Exception as e:
+            doc_ref.set({
+                'course_id': course_id,
+                'student_id': student_id,
+                'assignment_id': assignment_id,
+                'accuracy_score': 0.0,
+                'justification': 'Worker failed to authenticate to Drive.',
+                'debug_info': str(e),
+                'file_hashes': [],
+                'is_plagiarized': False
+            })
+            logger.error("Drive authentication failed: %s", e)
+            return jsonify({'error': 'drive auth failed'}), 500
 
-        # 5) detect if program expects input
-        expects_input = _has_stdin(fixed, lang)
-        details['expects_input'] = expects_input
+        if len(attachments) == 0:
+            doc_ref.set({
+                'course_id': course_id,
+                'student_id': student_id,
+                'assignment_id': assignment_id,
+                'accuracy_score': 0.0,
+                'justification': "No submission found.",
+                'debug_info': '',
+                'file_hashes': [],
+                'is_plagiarized': False
+            })
+            logger.warning("No attachments found for assignment_id=%s", assignment_id)
+            return jsonify({'status': 'no_attachments'}), 200
 
-        # 6) If expects input -> generate test cases and run them in docker (if available)
-        if expects_input:
-            test_cases = _generate_test_cases_simple(question, lang)
-            details['generated_testcases'] = test_cases
-            if not test_cases:
-                # cannot generate testcases -> fallback to conceptual scoring with penalty
-                score, just = _conceptual_score(question, fixed, lang)
-                score = score * 0.5  # penalty for missing test cases
-                return {'score': float(score), 'justification': f'No test cases could be generated. {just}', 'details': details}
-            passed, total, run_details = _run_code_in_docker(fixed, lang, test_cases)
-            details['run_details'] = run_details
-            if total == 0:
-                return {'score': 0.0, 'justification': 'No runnable test cases.', 'details': details}
-            score = passed / total
-            justification = f'Passed {passed}/{total} test cases.'
-            # if docker unavailable explain in details
-            if not _DOCKER_AVAILABLE:
-                justification = 'Docker not available to run tests; could not execute test cases.'
-                return {'score': 0.0, 'justification': justification, 'details': details}
-            return {'score': float(score), 'justification': justification, 'details': details}
+        # ----------------- Download attachments -----------------
+        ocr_texts = []
+        file_hashes = []
+        attachment_names = []
+        try:
+            for att in attachments:
+                drive_file = att.get('driveFile') or att.get('drive_file') or att
+                file_id = None
+                file_title = None
+                if isinstance(drive_file, dict):
+                    file_id = drive_file.get('id')
+                    file_title = drive_file.get('title') or drive_file.get('name')
+                if not file_id:
+                    continue
 
-        # 7) Otherwise, conceptual scoring
-        score, justification = _conceptual_score(question, fixed, lang)
-        return {'score': float(score), 'justification': justification, 'details': details}
+                request_media = drive_service.files().get_media(fileId=file_id)
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, request_media)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                file_bytes = fh.getvalue()
+
+                fhash = hashlib.sha256(file_bytes).hexdigest()
+                file_hashes.append(fhash)
+
+                try:
+                    meta = drive_service.files().get(fileId=file_id, fields='mimeType,name').execute()
+                    mime_type = meta.get('mimeType')
+                    if not file_title:
+                        file_title = meta.get('name')
+                except Exception:
+                    mime_type = None
+
+                try:
+                    text = extract_text_from_file(file_bytes, mime_type)
+                except Exception:
+                    text = ""
+                ocr_texts.append(text)
+                attachment_names.append(file_title or f"file_{file_id}")
+        except Exception as e:
+            doc_ref.set({
+                'course_id': course_id,
+                'student_id': student_id,
+                'assignment_id': assignment_id,
+                'accuracy_score': 0.0,
+                'justification': 'Worker failed while downloading attachments.',
+                'debug_info': str(e),
+                'file_hashes': file_hashes,
+                'is_plagiarized': False
+            })
+            logger.error("Attachment download failed: %s", e)
+            return jsonify({'error': 'download_failed'}), 500
+
+        # ----------------- Exact-file plagiarism check -----------------
+        try:
+            for fhash in file_hashes:
+                q = (
+                    db.collection('results')
+                    .where(filter={"field_path": "assignment_id", "op_string": "==", "value": assignment_id})
+                    .where(filter={"field_path": "file_hashes", "op_string": "array_contains", "value": fhash})
+                    .limit(1)
+                )
+                docs = list(q.stream())
+                if docs:
+                    prev = docs[0].to_dict()
+                    prev_student = prev.get('student_id')
+                    if prev_student and prev_student != student_id:
+                        doc_ref.set({
+                            'course_id': course_id,
+                            'student_id': student_id,
+                            'assignment_id': assignment_id,
+                            'accuracy_score': 0.0,
+                            'justification': 'Plagiarism detected (exact file match).',
+                            'debug_info': json.dumps({
+                                'matched_student': prev_student,
+                                'matched_doc_id': docs[0].id,
+                                'matched_hash': fhash
+                            }),
+                            'file_hashes': file_hashes,
+                            'is_plagiarized': True
+                        })
+                        logger.warning("Plagiarism detected for student=%s", student_id)
+                        return jsonify({'status': 'plagiarism_detected'}), 200
+        except Exception as e:
+            logger.error("Plagiarism check error: %s", e)
+
+        # ----------------- Map attachments to question parts -----------------
+        question_parts = split_question_into_parts(question)
+        num_parts = len(question_parts)
+
+        mapping = {}
+        if len(ocr_texts) == num_parts:
+            for i in range(num_parts):
+                mapping[i] = i
+        else:
+            q_tokens = [token_set(qp) for qp in question_parts]
+            for i, txt in enumerate(ocr_texts):
+                p_tokens = token_set(txt)
+                best_j = 0
+                best_score = -1.0
+                for j, qt in enumerate(q_tokens):
+                    score = len(p_tokens & qt) / max(1, len(qt)) if qt else 0.0
+                    if score > best_score:
+                        best_score = score
+                        best_j = j
+                mapping[i] = best_j
+
+        # ----------------- Analyze -----------------
+        part_results: Dict[int, dict] = {}
+        part_sources: Dict[int, Optional[int]] = {}
+
+        for att_idx, part_idx in mapping.items():
+            try:
+                ocr_text = ocr_texts[att_idx]
+                if not ocr_text.strip():
+                    result = {'score': 0.0, 'justification': f'Attachment {attachment_names[att_idx]}: OCR empty.'}
+                else:
+                    if domain == 'theory':
+                        result = analyze_theory_submission(
+                            question_parts[part_idx] if part_idx < len(question_parts) else question,
+                            ocr_text
+                        )
+                    else:
+                        result = analyze_programming_submission(
+                            question_parts[part_idx] if part_idx < len(question_parts) else question,
+                            ocr_text
+                        )
+            except Exception as e:
+                result = {'score': 0.0, 'justification': f'Analyzer error: {e}'}
+
+            score = float(result.get('score', 0.0))
+            if part_idx not in part_results or score > float(part_results[part_idx].get('score', 0.0)):
+                part_results[part_idx] = result
+                part_sources[part_idx] = att_idx
+
+        for j in range(num_parts):
+            if j not in part_results:
+                part_results[j] = {'score': 0.0, 'justification': f'Part {j+1}: No submission found.'}
+                part_sources[j] = None
+
+        part_scores = [float(part_results[j].get('score', 0.0)) for j in range(num_parts)]
+        final_score = (sum(part_scores) / len(part_scores)) if part_scores else 0.0
+
+        per_part_justifications = []
+        for j in range(num_parts):
+            just = part_results[j].get('justification', '')
+            src_idx = part_sources.get(j)
+            src_name = attachment_names[src_idx] if (src_idx is not None and src_idx < len(attachment_names)) else None
+            header = f"P{j+1}"
+            if src_name:
+                header += f" (from {src_name})"
+            per_part_justifications.append(f"{header}: {just}")
+
+        final_justification = " | ".join(per_part_justifications)
+
+        # ----------------- Save to Firestore -----------------
+        payload = {
+            'course_id': course_id,
+            'student_id': student_id,
+            'assignment_id': assignment_id,
+            'accuracy_score': final_score,
+            'justification': final_justification,
+            'part_results': part_results,
+            'part_sources': part_sources,
+            'file_hashes': file_hashes,
+            'is_plagiarized': False
+        }
+        try:
+            doc_ref.set(payload)
+        except Exception as e:
+            logger.error("DB write failed: %s", e)
+            return jsonify({'error': 'db_write_failed', 'detail': str(e)}), 500
+
+        logger.info("Task completed: student=%s assignment=%s score=%.2f", student_id, assignment_id, final_score)
+        return jsonify({'status': 'processed', 'score': final_score}), 200
 
     except Exception as e:
-        return {'score': 0.0, 'justification': f'Analyzer internal error: {e}', 'details': details}
+        logger.error("Task failed with error: %s", e)
+        logger.error(traceback.format_exc())
+        return jsonify({'error': 'task_failed', 'detail': str(e)}), 500
+
+
+# ----------------- Main -----------------
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), debug=False)
